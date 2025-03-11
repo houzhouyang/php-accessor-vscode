@@ -2,9 +2,9 @@
   "name": "php-accessor-vscode",
   "displayName": "PHP Accessor",
   "description": "一键生成对象的所有Setter调用语句",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "engines": {
-    "vscode": "^1.98.0"
+    "vscode": "^1.96.0"
   },
   "categories": [
     "Other"
@@ -66,7 +66,7 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.98.0",
+    "@types/vscode": "^1.96.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
     "@typescript-eslint/eslint-plugin": "^8.25.0",
