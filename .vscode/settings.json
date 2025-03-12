@@ -2,12 +2,42 @@
 {
     "files.exclude": {
         "out": false, // set this to true to hide the "out" folder with the compiled JS files
-        "dist": false // set this to true to hide the "dist" folder with the compiled JS files
+        "dist": false, // set this to true to hide the "dist" folder with the compiled JS files
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/CVS": true,
+        "**/.DS_Store": true,
+        "**/.php-accessor": false
     },
     "search.exclude": {
         "out": true, // set this to false to include "out" folder in search results
-        "dist": true // set this to false to include "dist" folder in search results
+        "dist": true, // set this to false to include "dist" folder in search results
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/CVS": true,
+        "**/.DS_Store": true,
+        "**/.php-accessor": true
     },
     // Turn off tsc task auto detection since we have the necessary tasks as npm scripts
-    "typescript.tsc.autoDetect": "off"
+    "typescript.tsc.autoDetect": "off",
+    // 确保PHP文件被正确索引
+    "php.suggest.basic": true,
+    // 确保PHP语言服务器能正确索引生成的文件
+    "php.files.exclude": {
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/CVS": true,
+        "**/.DS_Store": true,
+        "**/.php-accessor": false
+    },
+    "intelephense.files.associations": [
+        "**/*.php",
+        "**/.php-accessor/**/*.php"
+    ],
+    "files.associations": {
+        "**/.php-accessor/**/*.php": "php"
+    }
 }

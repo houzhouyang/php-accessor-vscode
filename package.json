@@ -2,7 +2,7 @@
   "name": "php-accessor-vscode",
   "displayName": "PHP Accessor",
   "description": "一键生成对象的所有Setter调用语句",
-  "version": "0.0.2",
+  "version": "0.0.4",
   "engines": {
     "vscode": "^1.96.0"
   },
@@ -28,6 +28,14 @@
       {
         "command": "php-accessor-vscode.navigateToAccessor",
         "title": "PHP Accessor: Navigate to Accessor"
+      },
+      {
+        "command": "php-accessor-vscode.refreshAccessorIndex",
+        "title": "PHP Accessor: 刷新代理类文件索引"
+      },
+      {
+        "command": "php-accessor-vscode.debug",
+        "title": "PHP Accessor: 调试当前位置"
       }
     ],
     "languages": [
@@ -46,6 +54,16 @@
         {
           "when": "editorLangId == php",
           "command": "php-accessor-vscode.navigateToAccessor",
+          "group": "navigation"
+        },
+        {
+          "when": "editorLangId == php",
+          "command": "php-accessor-vscode.refreshAccessorIndex",
+          "group": "navigation"
+        },
+        {
+          "when": "editorLangId == php",
+          "command": "php-accessor-vscode.debug",
           "group": "navigation"
         }
       ]
