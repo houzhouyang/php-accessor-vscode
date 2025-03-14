@@ -398,13 +398,6 @@ async function configurePHPLanguageServer() {
             await config.update('files.associations', associations, vscode.ConfigurationTarget.Workspace);
         }
         
-        try {
-            // 对于PHP IntelliSense
-            await config.update('php.suggest.basic', true, vscode.ConfigurationTarget.Workspace);
-        } catch (error) {
-            console.log('设置php.suggest.basic时出错，可能未安装该扩展:', error);
-        }
-        
         console.log('PHP语言服务器配置已更新');
     } catch (error) {
         console.error('配置PHP语言服务器时出错:', error);
