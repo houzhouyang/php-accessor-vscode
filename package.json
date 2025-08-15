@@ -1,8 +1,8 @@
 {
   "name": "php-accessor-vscode",
   "displayName": "PHP Accessor",
-  "description": "一键生成对象的所有Setter调用语句",
-  "version": "0.0.5",
+  "description": "一键生成对象的所有Setter调用语句，支持智能导航和精确跳转",
+      "version": "0.3.1",
   "engines": {
     "vscode": "^1.96.0"
   },
@@ -36,6 +36,10 @@
       {
         "command": "php-accessor-vscode.debug",
         "title": "PHP Accessor: 调试当前位置"
+      },
+      {
+        "command": "php-accessor-vscode.diagnose-proxy",
+        "title": "PHP Accessor: 诊断代理类跳转"
       }
     ],
     "languages": [
@@ -64,6 +68,11 @@
         {
           "when": "editorLangId == php",
           "command": "php-accessor-vscode.debug",
+          "group": "navigation"
+        },
+        {
+          "when": "editorLangId == php",
+          "command": "php-accessor-vscode.diagnose-proxy",
           "group": "navigation"
         }
       ]

@@ -4,6 +4,10 @@ import * as fs from 'fs';
 import { parsePhpClass } from './utils/phpParser';
 
 export class AccessorNavigator {
+    // 用于缓存已找到的类关联和文件路径
+    private classPropertyCache = new Map<string, Map<string, vscode.Location>>();
+    private classFileCache = new Map<string, string | null>();
+
     /**
      * Navigate from an accessor to its property
      */
@@ -40,55 +44,107 @@ export class AccessorNavigator {
             return;
         }
         
-        // If not found in current document, try to find in .php-accessor proxy classes
+        // If not found in current document, try to find in Hyperf accessor directories  
         try {
             // Get the current file path
             const currentFilePath = editor.document.uri.fsPath;
-            const workspaceFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
             
-            if (workspaceFolder) {
-                // Look for a .php-accessor directory in the workspace
-                const phpAccessorDir = path.join(path.dirname(currentFilePath), '.php-accessor');
+            // Check if current file has Hyperf accessor traits
+            const accessorInfo = await this.findHyperfAccessorForCurrentClass(editor.document);
+            
+            if (accessorInfo) {
+                // Navigate to the accessor trait
+                const accessorFilePath = accessorInfo.traitPath;
+                const accessorDoc = await vscode.workspace.openTextDocument(accessorFilePath);
                 
-                // If directory exists, search for property in proxy classes
-                if (fs.existsSync(phpAccessorDir)) {
-                    // Get class name from current file
-                    const className = this.getClassNameFromDocument(editor.document);
-                    if (!className) {
-                        vscode.window.showInformationMessage(`Property $${propertyName} not found, and couldn't determine class name.`);
+                // Search for the property accessor in the trait file
+                const getterName = `get${propertyName.charAt(0).toUpperCase() + propertyName.slice(1)}`;
+                const setterName = `set${propertyName.charAt(0).toUpperCase() + propertyName.slice(1)}`;
+                
+                const accessorText = accessorDoc.getText();
+                
+                // Look for getter or setter method
+                const getterRegex = new RegExp(`function\\s+${getterName}\\s*\\(`, 'i');
+                const setterRegex = new RegExp(`function\\s+${setterName}\\s*\\(`, 'i');
+                
+                const getterMatch = getterRegex.exec(accessorText);
+                const setterMatch = setterRegex.exec(accessorText);
+                
+                if (getterMatch || setterMatch) {
+                    const match = getterMatch || setterMatch;
+                    const methodPos = accessorDoc.positionAt(match!.index);
+                    const accessorEditor = await vscode.window.showTextDocument(accessorDoc);
+                    accessorEditor.selection = new vscode.Selection(methodPos, methodPos);
+                    accessorEditor.revealRange(new vscode.Range(methodPos, methodPos));
                         return;
-                    }
-                    
-                    // Look for a proxy class file
-                    const proxyFiles = fs.readdirSync(phpAccessorDir)
-                        .filter(file => file.endsWith('.php') && file.includes(className));
-                    
-                    if (proxyFiles.length > 0) {
-                        // Open the first matching proxy file
-                        const proxyFilePath = path.join(phpAccessorDir, proxyFiles[0]);
-                        const proxyDoc = await vscode.workspace.openTextDocument(proxyFilePath);
-                        
-                        // Search for the property in the proxy file
-                        const proxyText = proxyDoc.getText();
-                        const proxyMatch = propertyRegex.exec(proxyText);
-                        
-                        if (proxyMatch) {
-                            // Open the file and navigate to the property
-                            const propertyPos = proxyDoc.positionAt(proxyMatch.index);
-                            const editor = await vscode.window.showTextDocument(proxyDoc);
-                            editor.selection = new vscode.Selection(propertyPos, propertyPos);
-                            editor.revealRange(new vscode.Range(propertyPos, propertyPos));
-                            return;
-                        }
-                    }
                 }
             }
             
             // If we get here, the property was not found anywhere
-            vscode.window.showInformationMessage(`Property $${propertyName} not found in current file or proxy classes.`);
+            vscode.window.showInformationMessage(`Property $${propertyName} not found in current file or accessor traits.`);
         } catch (error) {
-            console.error('Error searching for property in proxy classes:', error);
+            console.error('Error searching for property in accessor traits:', error);
             vscode.window.showInformationMessage(`Property $${propertyName} not found in current document.`);
+        }
+    }
+
+    /**
+     * 为当前类查找对应的Hyperf访问器trait
+     */
+    private async findHyperfAccessorForCurrentClass(document: vscode.TextDocument): Promise<{traitPath: string, className: string} | null> {
+        try {
+            const text = document.getText();
+            const currentFilePath = document.uri.fsPath;
+            
+            // 从当前文件的include_once语句中查找accessor路径
+            const includeMatch = text.match(/include_once\s+['"](accessor\/.+?\.php)['"]/);
+            
+            if (includeMatch) {
+                const accessorRelativePath = includeMatch[1];
+                const currentDir = path.dirname(currentFilePath);
+                const accessorFilePath = path.join(currentDir, accessorRelativePath);
+                
+                if (fs.existsSync(accessorFilePath)) {
+                    const className = this.getClassNameFromDocument(document);
+                    return {
+                        traitPath: accessorFilePath,
+                        className: className || ''
+                    };
+                }
+            }
+            
+            // 如果没有找到include_once，尝试基于类名推断
+            const className = this.getClassNameFromDocument(document);
+            if (!className) {
+                return null;
+            }
+            
+            // 获取当前类的命名空间
+            const namespaceMatch = text.match(/namespace\s+([^;]+);/);
+            if (!namespaceMatch) {
+                return null;
+            }
+            
+            const namespace = namespaceMatch[1];
+            const fullClassName = `${namespace}\\${className}`;
+            
+            // 构造accessor文件名
+            const accessorFileName = `_Proxy_${fullClassName.replace(/\\/g, '_')}Accessor.php`;
+            const currentDir = path.dirname(currentFilePath);
+            const accessorDir = path.join(currentDir, 'accessor');
+            const accessorFilePath = path.join(accessorDir, accessorFileName);
+            
+            if (fs.existsSync(accessorFilePath)) {
+                return {
+                    traitPath: accessorFilePath,
+                    className: className
+                };
+            }
+            
+            return null;
+        } catch (error) {
+            console.error('查找Hyperf访问器时出错:', error);
+            return null;
         }
     }
 
@@ -158,68 +214,53 @@ export class AccessorNavigator {
             }
         }
         
-        // If not found in current document, try to find in .php-accessor proxy classes
+        // If not found in current document, try to find in Hyperf accessor trait
         try {
-            // Get the current file path
-            const currentFilePath = editor.document.uri.fsPath;
-            const workspaceFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
+            // Check if current file has Hyperf accessor traits
+            const accessorInfo = await this.findHyperfAccessorForCurrentClass(editor.document);
             
-            if (workspaceFolder) {
-                // Look for a .php-accessor directory in the workspace
-                const phpAccessorDir = path.join(path.dirname(currentFilePath), '.php-accessor');
+            if (accessorInfo) {
+                // Navigate to the accessor trait
+                const accessorFilePath = accessorInfo.traitPath;
+                const accessorDoc = await vscode.workspace.openTextDocument(accessorFilePath);
                 
-                // If directory exists, search for accessors in proxy classes
-                if (fs.existsSync(phpAccessorDir)) {
-                    // Get class name from current file
-                    const className = this.getClassNameFromDocument(editor.document);
-                    if (!className) {
-                        vscode.window.showInformationMessage(`Accessors for $${propertyName} not found, and couldn't determine class name.`);
-                        return;
-                    }
-                    
-                    // Look for a proxy class file
-                    const proxyFiles = fs.readdirSync(phpAccessorDir)
-                        .filter(file => file.endsWith('.php') && file.includes(className));
-                    
-                    if (proxyFiles.length > 0) {
-                        // Open the first matching proxy file
-                        const proxyFilePath = path.join(phpAccessorDir, proxyFiles[0]);
-                        const proxyDoc = await vscode.workspace.openTextDocument(proxyFilePath);
-                        
-                        // Search for the accessors in the proxy file
-                        const proxyText = proxyDoc.getText();
-                        const proxyGetterMatch = getterRegex.exec(proxyText);
-                        const proxySetterMatch = setterRegex.exec(proxyText);
-                        
-                        if (proxyGetterMatch || proxySetterMatch) {
+                // Search for the accessors in the trait file
+                const accessorText = accessorDoc.getText();
+                
+                // Reset regex to search in the trait file
+                const traitGetterRegex = new RegExp(`function\\s+get${capitalizedName}\\s*\\(`, 'g');
+                const traitSetterRegex = new RegExp(`function\\s+set${capitalizedName}\\s*\\(`, 'g');
+                
+                const traitGetterMatch = traitGetterRegex.exec(accessorText);
+                const traitSetterMatch = traitSetterRegex.exec(accessorText);
+                
+                if (traitGetterMatch || traitSetterMatch) {
                             // Show a quick pick to choose between getter and setter
                             const options = [];
-                            if (proxyGetterMatch) {
-                                options.push('Getter (in proxy class)');
+                    if (traitGetterMatch) {
+                        options.push('Getter (in accessor trait)');
                             }
-                            if (proxySetterMatch) {
-                                options.push('Setter (in proxy class)');
+                    if (traitSetterMatch) {
+                        options.push('Setter (in accessor trait)');
                             }
                             
                             const choice = await vscode.window.showQuickPick(options, {
                                 placeHolder: 'Navigate to...'
                             });
                             
-                            // Open the editor for the proxy file
-                            const proxyEditor = await vscode.window.showTextDocument(proxyDoc);
-                            
-                            if (choice === 'Getter (in proxy class)' && proxyGetterMatch) {
-                                const getterPos = proxyDoc.positionAt(proxyGetterMatch.index);
-                                proxyEditor.selection = new vscode.Selection(getterPos, getterPos);
-                                proxyEditor.revealRange(new vscode.Range(getterPos, getterPos));
+                    // Open the editor for the trait file
+                    const traitEditor = await vscode.window.showTextDocument(accessorDoc);
+                    
+                    if (choice === 'Getter (in accessor trait)' && traitGetterMatch) {
+                        const getterPos = accessorDoc.positionAt(traitGetterMatch.index);
+                        traitEditor.selection = new vscode.Selection(getterPos, getterPos);
+                        traitEditor.revealRange(new vscode.Range(getterPos, getterPos));
                                 return;
-                            } else if (choice === 'Setter (in proxy class)' && proxySetterMatch) {
-                                const setterPos = proxyDoc.positionAt(proxySetterMatch.index);
-                                proxyEditor.selection = new vscode.Selection(setterPos, setterPos);
-                                proxyEditor.revealRange(new vscode.Range(setterPos, setterPos));
+                    } else if (choice === 'Setter (in accessor trait)' && traitSetterMatch) {
+                        const setterPos = accessorDoc.positionAt(traitSetterMatch.index);
+                        traitEditor.selection = new vscode.Selection(setterPos, setterPos);
+                        traitEditor.revealRange(new vscode.Range(setterPos, setterPos));
                                 return;
-                            }
-                        }
                     }
                 }
             }
@@ -227,7 +268,7 @@ export class AccessorNavigator {
             // If we get here, no accessors were found
             vscode.window.showInformationMessage(`No accessors found for $${propertyName}`);
         } catch (error) {
-            console.error('Error searching for accessors in proxy classes:', error);
+            console.error('Error searching for accessors in trait files:', error);
             vscode.window.showInformationMessage(`No accessors found for $${propertyName}`);
         }
     }
@@ -267,7 +308,7 @@ export class AccessorNavigator {
                 }
                 
                 // 2. 确定处理策略
-                const isProxyFile = currentFilePath.includes('.php-accessor');
+                const isProxyFile = this.isHyperfProxyFile(currentFilePath);
                 const lineText = document.lineAt(position.line).text;
                 const wordStart = wordRange.start.character;
                 const beforeWordText = lineText.substring(0, wordStart);
@@ -280,7 +321,7 @@ export class AccessorNavigator {
                 
                 // 4. 处理方法调用的跳转
                 if (isMethodCall) {
-                    return this.handleMethodCallNavigation(document, word, propertyName, cacheKey, classPropertyCache);
+                    return this.handleMethodCallNavigation(document, position, word, propertyName, cacheKey, classPropertyCache);
                 }
                 
                 return null;
@@ -289,7 +330,7 @@ export class AccessorNavigator {
     }
 
     /**
-     * 处理从代理文件内部跳转到原始属性
+     * 处理从Hyperf代理trait跳转到原始类属性
      */
     private async handleProxyFileNavigation(
         document: vscode.TextDocument, 
@@ -300,51 +341,439 @@ export class AccessorNavigator {
         classPropertyCache: Map<string, Map<string, vscode.Location>>
     ): Promise<vscode.Location | null> {
         try {
-            // 1. 确定目录结构
-            const proxyDirPath = path.dirname(currentFilePath);
-            const originalDirPath = path.dirname(proxyDirPath);
             
-            // 2. 提取类名
-            const text = document.getText();
-            let className = this.extractClassNameFromContent(text) || 
-                           this.extractClassNameFromFileName(path.basename(currentFilePath));
+            // 1. 解析Hyperf代理文件名格式
+            const fileName = path.basename(currentFilePath, '.php');
             
-            if (!className) {
+            const originalClassInfo = this.parseHyperfProxyFileName(fileName);
+            
+            if (!originalClassInfo) {
+                console.error(`❌ 无法解析代理文件名: ${fileName}`);
                 return null;
             }
             
-            // 3. 快速查找可能的原始文件 - 不使用异步搜索API
-            const directFilePath = path.join(originalDirPath, `${className}.php`);
             
-            if (fs.existsSync(directFilePath)) {
-                return this.findPropertyInFile(directFilePath, className, propertyName, cacheKey, classPropertyCache);
+            // 2. 尝试加载meta文件获取精确的属性映射
+            const propertyMapping = await this.loadPropertyMappingFromMeta(currentFilePath, word);
+            
+            if (propertyMapping) {
+            } else {
             }
             
-            // 尝试几个常见的命名模式
-            const alternativeFilePaths = [
-                path.join(originalDirPath, `class.${className.toLowerCase()}.php`),
-                path.join(originalDirPath, `${className.toLowerCase()}.php`),
-                path.join(originalDirPath, `class-${className.toLowerCase()}.php`)
-            ];
+            // 3. 查找原始类文件以解析命名约定
             
-            for (const filePath of alternativeFilePaths) {
-                if (fs.existsSync(filePath)) {
-                    const result = await this.findPropertyInFile(filePath, className, propertyName, cacheKey, classPropertyCache);
-                    if (result) return result;
+            const originalClassFile = await this.findOriginalClassFromNamespace(originalClassInfo);
+            
+            if (!originalClassFile) {
+                console.error(`❌ 未找到原始类文件:`);
+                
+                // 显示尝试的路径
+                await this.debugShowAttemptedPaths(originalClassInfo);
+                return null;
+            }
+            
+            
+            // 4. 读取原始类内容并解析命名约定
+            let namingConvention = 2; // 默认 LOWER_CAMEL_CASE
+            let propertyNameVariants: string[] = [];
+            
+            try {
+                const originalClassContent = fs.readFileSync(originalClassFile, 'utf8');
+                namingConvention = this.parseNamingConvention(originalClassContent);
+                
+                const conventionNames: Record<number, string> = {1: 'NONE', 2: 'LOWER_CAMEL_CASE', 3: 'UPPER_CAMEL_CASE'};
+                
+                // 生成可能的属性名变体
+                propertyNameVariants = this.generatePropertyNameVariants(word, namingConvention);
+                
+            } catch (error) {
+                console.error(`⚠️  读取原始类文件失败，使用默认命名约定:`, error);
+                propertyNameVariants = [propertyName, this.camelToSnakeCase(propertyName)];
+            }
+            
+            // 5. 确定最终的属性名（优先使用meta映射）
+            let realPropertyName: string;
+            if (propertyMapping?.fieldName) {
+                realPropertyName = propertyMapping.fieldName;
+            } else {
+                // 使用命名约定的主要变体
+                realPropertyName = propertyNameVariants[0];
+            }
+            
+            // 5. 尝试多个属性名变体进行查找
+            
+            // 构建搜索候选列表（优先级顺序）
+            const searchCandidates: string[] = [];
+            
+            // 1. 优先使用meta映射的名称
+            if (propertyMapping?.fieldName) {
+                searchCandidates.push(propertyMapping.fieldName);
+            }
+            
+            // 2. 添加基于命名约定的变体
+            if (propertyNameVariants.length > 0) {
+                for (const variant of propertyNameVariants) {
+                    if (!searchCandidates.includes(variant)) {
+                        searchCandidates.push(variant);
+                    }
                 }
             }
             
-            // 4. 当所有快速查找方法失败时，使用更昂贵的搜索 - 但有限制
-            const phpFiles = await this.findPhpFilesInDir(originalDirPath, 10); // 限制最多搜索10个文件
             
-            for (const phpFile of phpFiles) {
-                const result = await this.findPropertyInFile(phpFile, className, propertyName, cacheKey, classPropertyCache);
-                if (result) return result;
+            // 逐个尝试搜索候选
+            for (let i = 0; i < searchCandidates.length; i++) {
+                const candidateName = searchCandidates[i];
+                
+                const result = await this.findPropertyInFile(
+                    originalClassFile, 
+                    originalClassInfo.className, 
+                    candidateName, 
+                    `${cacheKey}_${candidateName}`, 
+                    classPropertyCache,
+                    true // 强制查找原始类
+                );
+                
+                if (result) {
+                    return result;
+                }
+                
+            }
+            
+            console.error(`❌ 所有属性名变体都未找到:`);
+            
+            // 显示类中的所有属性供参考
+            await this.debugShowClassProperties(originalClassFile);
+            
+            // 不进行错误的回退搜索，避免跳转到错误的类
+            return null;
+            
+        } catch (error) {
+            console.error('=== 💥 代理类跳转异常 ===');
+            console.error('错误详情:', error);
+            return null;
+        }
+    }
+    
+    /**
+     * 调试：显示尝试查找的路径
+     */
+    private async debugShowAttemptedPaths(classInfo: {className: string, fullClassName: string, namespace: string}): Promise<void> {
+        try {
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
+                return;
+            }
+            
+            const workspaceRoot = workspaceFolders[0].uri.fsPath;
+            const namespacePath = classInfo.namespace.split('\\');
+            
+            
+            const possiblePaths = [
+                path.join(workspaceRoot, namespacePath[0].toLowerCase(), ...namespacePath.slice(1), `${classInfo.className}.php`),
+                path.join(workspaceRoot, ...namespacePath, `${classInfo.className}.php`),
+                path.join(workspaceRoot, 'src', ...namespacePath.slice(1), `${classInfo.className}.php`),
+                path.join(workspaceRoot, 'app', ...namespacePath.slice(1), `${classInfo.className}.php`),
+                path.join(workspaceRoot, 'lib', ...namespacePath, `${classInfo.className}.php`),
+            ];
+            
+            for (let i = 0; i < possiblePaths.length; i++) {
+                const filePath = possiblePaths[i];
+                const exists = fs.existsSync(filePath);
+            }
+        } catch (error) {
+            console.error('   ❌ 调试路径显示失败:', error);
+        }
+    }
+    
+    /**
+     * 调试：显示类中的所有属性
+     */
+    private async debugShowClassProperties(classFilePath: string): Promise<void> {
+        try {
+            const content = fs.readFileSync(classFilePath, 'utf8');
+            const propertyPattern = /(public|protected|private)\s+(?:readonly\s+)?(?:\w+\s+)?\$(\w+)/g;
+            const properties: string[] = [];
+            
+            let match;
+            while ((match = propertyPattern.exec(content)) !== null) {
+                properties.push(match[2]);
+            }
+            
+
+        } catch (error) {
+            console.error('   ❌ 读取类属性失败:', error);
+        }
+    }
+    
+    /**
+     * 解析Hyperf代理文件名，提取原始类信息
+     * 格式: _Proxy_App_Domain_Access_Entity_AccessModifyRecordAccessor.php
+     */
+    private parseHyperfProxyFileName(fileName: string): {className: string, fullClassName: string, namespace: string} | null {
+        // 匹配_Proxy_开头的文件名
+        const proxyPattern = /^_Proxy_(.+?)Accessor$/;
+        const match = fileName.match(proxyPattern);
+        
+        if (!match) {
+                return null;
+            }
+
+        // 将下划线分隔的路径转换为命名空间
+        const namespaceParts = match[1].split('_');
+        const className = namespaceParts[namespaceParts.length - 1];
+        const namespace = namespaceParts.slice(0, -1).join('\\');
+        const fullClassName = namespaceParts.join('\\');
+        
+        return {
+            className,
+            namespace,
+            fullClassName
+        };
+    }
+    
+    /**
+     * 从meta文件加载属性映射信息
+     */
+    private async loadPropertyMappingFromMeta(proxyFilePath: string, methodName: string): Promise<{fieldName: string, methodName: string} | null> {
+        try {
+            // 确定meta文件路径
+            const proxyDir = path.dirname(proxyFilePath);
+            const metaDir = path.join(path.dirname(proxyDir), 'meta');
+            
+            // 查找对应的meta文件
+            if (!fs.existsSync(metaDir)) {
+                return null;
+            }
+            
+            const metaFiles = fs.readdirSync(metaDir).filter(file => file.endsWith('.json'));
+            
+            for (const metaFile of metaFiles) {
+                const metaPath = path.join(metaDir, metaFile);
+                
+                try {
+                    const metaContent = fs.readFileSync(metaPath, 'utf8');
+                    const metaData = JSON.parse(metaContent);
+                    
+                    // 查找匹配的方法
+                    if (metaData.methods && Array.isArray(metaData.methods)) {
+                        const method = metaData.methods.find((m: any) => 
+                            m.methodName && m.methodName.toLowerCase() === methodName.toLowerCase()
+                        );
+                        
+                        if (method) {
+                            return {
+                                fieldName: method.fieldName,
+                                methodName: method.methodName
+                            };
+                        }
+                    }
+                } catch (err) {
+                    console.log(`解析meta文件失败: ${metaPath}`, err);
+                    continue;
+                }
             }
             
             return null;
         } catch (error) {
-            console.error('Error finding property in proxy file:', error);
+            return null;
+        }
+    }
+    
+    /**
+     * 将访问器方法名转换为属性名（处理驼峰转换）
+     */
+    private convertAccessorToProperty(methodName: string, defaultPropertyName: string): string {
+        // 对于Hyperf框架，可能存在以下转换规律：
+        // getGroupcode -> groupCode
+        // getAccessno -> accessNo  
+        // getSuppliername -> supplierName
+        
+        // 移除get/set前缀
+        const baseName = methodName.substring(3);
+        
+        // 常见的缩写词映射
+        const abbreviationMap: Record<string, string> = {
+            'code': 'Code',
+            'no': 'No',
+            'num': 'Num', 
+            'name': 'Name',
+            'id': 'Id',
+            'type': 'Type',
+            'info': 'Info',
+            'key': 'Key'
+        };
+        
+        // 尝试智能转换
+        let result = defaultPropertyName;
+        
+        // 检查是否包含常见缩写
+        for (const [abbr, proper] of Object.entries(abbreviationMap)) {
+            const pattern = new RegExp(`${abbr}$`, 'i');
+            if (pattern.test(baseName)) {
+                const prefix = baseName.substring(0, baseName.length - abbr.length);
+                result = prefix + proper;
+                    break;
+                                }
+                            }
+        
+        return result;
+    }
+    
+    /**
+     * 解析类的命名约定
+     */
+    private parseNamingConvention(classContent: string): number {
+        try {
+            // 查找 #[Data(namingConvention: NamingConvention::XXX)] 注解
+            const dataAnnotationMatch = classContent.match(/#\[Data\([^)]*namingConvention:\s*NamingConvention::(\w+)[^)]*\)]/);
+            if (dataAnnotationMatch) {
+                const convention = dataAnnotationMatch[1];
+                switch (convention) {
+                    case 'NONE': return 1;
+                    case 'LOWER_CAMEL_CASE': return 2;
+                    case 'UPPER_CAMEL_CASE': return 3;
+                    default: return 2; // 默认小驼峰
+                }
+            }
+            
+            // 查找 #[HyperfData] 注解，默认使用小驼峰
+            if (classContent.includes('#[HyperfData]')) {
+                return 2; // LOWER_CAMEL_CASE
+            }
+            
+            // 如果没有找到注解，默认不转换
+            return 1; // NONE
+        } catch (error) {
+            console.error('解析命名约定时出错:', error);
+            return 2; // 默认小驼峰
+        }
+    }
+    
+    /**
+     * 根据命名约定转换属性名
+     */
+    private convertPropertyNameByConvention(methodName: string, convention: number): string {
+        // 去掉 get/set 前缀
+        let propertyBase = methodName.substring(3);
+        
+        switch (convention) {
+            case 1: // NONE - 不转换，保持原样
+                return propertyBase.charAt(0).toLowerCase() + propertyBase.slice(1);
+                
+            case 2: // LOWER_CAMEL_CASE - 小驼峰
+                return propertyBase.charAt(0).toLowerCase() + propertyBase.slice(1);
+                
+            case 3: // UPPER_CAMEL_CASE - 大驼峰  
+                return propertyBase.charAt(0).toUpperCase() + propertyBase.slice(1);
+                
+            default:
+                return propertyBase.charAt(0).toLowerCase() + propertyBase.slice(1);
+        }
+    }
+    
+    /**
+     * 根据命名约定将方法名转换为可能的属性名变体
+     */
+    private generatePropertyNameVariants(methodName: string, convention: number): string[] {
+        const variants: string[] = [];
+        const propertyBase = methodName.substring(3); // 去掉get/set
+        
+        // 根据约定生成主要变体
+        const primaryName = this.convertPropertyNameByConvention(methodName, convention);
+        variants.push(primaryName);
+        
+        // 总是添加一些常见变体以防注解解析错误
+        variants.push(propertyBase.charAt(0).toLowerCase() + propertyBase.slice(1)); // 小驼峰
+        variants.push(this.camelToSnakeCase(propertyBase)); // 下划线格式
+        
+        // 去重
+        return [...new Set(variants)];
+    }
+    
+    /**
+     * 驼峰转下划线
+     */
+    private camelToSnakeCase(str: string): string {
+        return str.replace(/([A-Z])/g, '_$1').toLowerCase().replace(/^_/, '');
+    }
+    
+    /**
+     * 检测是否为Hyperf代理文件
+     */
+    public isHyperfProxyFile(filePath: string): boolean {
+        try {
+            // 检查文件路径是否包含accessor目录
+            if (!filePath.includes('accessor')) {
+                return false;
+            }
+            
+            const fileName = path.basename(filePath, '.php');
+            
+            // 检查文件名是否符合Hyperf代理文件格式
+            const isProxyFileName = fileName.startsWith('_Proxy_') && fileName.endsWith('Accessor');
+            
+            if (!isProxyFileName) {
+                return false;
+            }
+            
+            // 进一步验证文件内容是否为trait
+                if (fs.existsSync(filePath)) {
+                const content = fs.readFileSync(filePath, 'utf8');
+                return content.includes('trait ' + fileName);
+            }
+            
+            return true;
+        } catch (error) {
+            return false;
+        }
+    }
+    
+    /**
+     * 根据命名空间查找原始类文件
+     */
+    private async findOriginalClassFromNamespace(classInfo: {className: string, fullClassName: string, namespace: string}): Promise<string | null> {
+        try {
+            // 使用现有的缓存查找机制
+            const cachedPath = await this.findClassFileFromNamespaceWithCache(classInfo.fullClassName);
+            if (cachedPath) {
+                return cachedPath;
+            }
+            
+            // 如果缓存查找失败，尝试基于PSR-4规范的路径推断
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
+                return null;
+            }
+            
+            const workspaceRoot = workspaceFolders[0].uri.fsPath;
+            
+            // 将命名空间转换为文件路径
+            // App\Domain\Access\Entity -> app/Domain/Access/Entity
+            const namespacePath = classInfo.namespace.split('\\');
+            
+            // 增强的PSR-4映射规则，针对实际项目结构优化
+            const possiblePaths = [
+                // 标准PSR-4: App -> app/ (最常用)
+                path.join(workspaceRoot, namespacePath[0].toLowerCase(), ...namespacePath.slice(1), `${classInfo.className}.php`),
+                // 直接映射: App -> App/
+                path.join(workspaceRoot, ...namespacePath, `${classInfo.className}.php`),
+                // src目录映射: App -> src/
+                path.join(workspaceRoot, 'src', ...namespacePath.slice(1), `${classInfo.className}.php`),
+                // src直接映射: App -> src/App/
+                path.join(workspaceRoot, 'src', ...namespacePath, `${classInfo.className}.php`),
+                // 常见的web项目结构
+                path.join(workspaceRoot, 'application', ...namespacePath.slice(1), `${classInfo.className}.php`),
+            ];
+            
+            for (const filePath of possiblePaths) {
+                if (fs.existsSync(filePath)) {
+                    return filePath;
+                }
+            }
+            
+            return null;
+        } catch (error) {
+            console.error('查找原始类文件时出错:', error);
             return null;
         }
     }
@@ -354,313 +783,764 @@ export class AccessorNavigator {
      */
     private async handleMethodCallNavigation(
         document: vscode.TextDocument,
+        position: vscode.Position,
         word: string,
         propertyName: string,
         cacheKey: string,
         classPropertyCache: Map<string, Map<string, vscode.Location>>
     ): Promise<vscode.Location | null> {
         try {
-            // 获取光标所在行和位置
-            const position = document.positionAt(document.getText().indexOf(word));
+            // **优先逻辑：尝试从上下文推断调用对象类型**
             const lineText = document.lineAt(position.line).text;
-            const lineIndex = position.line;
             
-            // 提取对象名称 - 更精确的匹配
-            const methodCallPattern = /(\$\w+)->(?:get|set)\w+/;
-            const objNameMatch = lineText.match(methodCallPattern);
+            // 智能提取调用对象（支持链式调用和直接调用）
+            const callerInfo = this.extractMethodCaller(document, position, word);
+            if (callerInfo && callerInfo.type) {
+                // 尝试找到对应的代理文件
+                const targetLocation = await this.findPropertyByTargetClass(callerInfo.type, propertyName);
+                if (targetLocation) {
+                    return targetLocation;
+                }
+            }
             
-            if (!objNameMatch || !objNameMatch[1]) {
+            // **回退逻辑：搜索包含目标方法的代理文件**
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
                 return null;
             }
 
-            const objectName = objNameMatch[1];
-            const fullText = document.getText();
+            // 使用直接文件系统搜索代理文件
+            const workspaceRoot = workspaceFolders[0].uri.fsPath;
+            const proxyDir = path.join(workspaceRoot, '.php-accessor', 'proxy', 'accessor');
             
-            // 缓存use语句以提高性能
-            const useStatements = this.extractUseStatements(fullText);
-            
-            // 创建类型数组，按优先级存储可能的类型
-            const potentialTypes: Array<{type: string, source: string, fullClassName: string | null}> = [];
-            
-            // 1. 首先查找PHPDoc注释类型（优先级最高）
-            // 向上查找最近的PHPDoc注释
-            let typeFromPhpDoc = null;
-            let searchLine = lineIndex - 1;
-            const maxLinesToSearch = 10; // 限制最大搜索行数，避免查找过多
-            
-            while (searchLine >= 0 && searchLine >= lineIndex - maxLinesToSearch) {
-                const searchText = document.lineAt(searchLine).text.trim();
-                if (searchText.includes('@var') && searchText.includes(objectName.replace('$', ''))) {
-                    // 提取当前行及上下文构成的文本块
-                    const contextStart = Math.max(0, searchLine - 2);
-                    const contextEnd = searchLine + 1;
-                    const contextLines = [];
-                    
-                    for (let i = contextStart; i <= contextEnd; i++) {
-                        contextLines.push(document.lineAt(i).text);
-                    }
-                    
-                    const contextText = contextLines.join('\n');
-                    typeFromPhpDoc = this.findObjectTypeFromVarAnnotation(contextText, objectName);
-                    
-                    if (typeFromPhpDoc) {
-                        console.log(`在PHPDoc注释中找到 ${objectName} 的类型: ${typeFromPhpDoc}`);
-                        
-                        // 解析完整类名
-                        let fullClassName = typeFromPhpDoc;
-                        if (!typeFromPhpDoc.includes('\\')) {
-                            // 查找匹配的use语句
-                            for (const useStatement of useStatements) {
-                                if (useStatement.className === typeFromPhpDoc) {
-                                    fullClassName = useStatement.fullPath;
-                                    console.log(`PHPDoc类型 ${typeFromPhpDoc} 解析为完整类名: ${fullClassName}`);
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        potentialTypes.push({
-                            type: typeFromPhpDoc, 
-                            source: 'phpDoc',
-                            fullClassName: fullClassName
-                        });
-                        break;
-                    }
-                }
-                
-                // 如果遇到空行或代码块结束，可以停止向上搜索
-                if (searchText === '' || searchText === '}') {
-                    break;
-                }
-                
-                searchLine--;
+            let proxyFiles: vscode.Uri[] = [];
+            if (fs.existsSync(proxyDir)) {
+                const files = fs.readdirSync(proxyDir)
+                    .filter(file => file.endsWith('Accessor.php'))
+                    .map(file => vscode.Uri.file(path.join(proxyDir, file)));
+                proxyFiles = files;
+            } else {
+                // 回退到vscode搜索
+                proxyFiles = await vscode.workspace.findFiles(
+                    '**/.php-accessor/proxy/accessor/*Accessor.php',
+                    '**/vendor/**'
+                );
             }
             
-            // 2. 其次搜索文件中的所有PHPDoc注释
-            if (!typeFromPhpDoc) {
-                const globalTypeFromPhpDoc = this.findObjectTypeFromVarAnnotation(fullText, objectName);
-                if (globalTypeFromPhpDoc) {
-                    console.log(`在全局PHPDoc注释中找到 ${objectName} 的类型: ${globalTypeFromPhpDoc}`);
+            for (const proxyFile of proxyFiles) {
+                try {
+                    const content = fs.readFileSync(proxyFile.fsPath, 'utf8');
                     
-                    // 解析完整类名
-                    let fullClassName = globalTypeFromPhpDoc;
-                    if (!globalTypeFromPhpDoc.includes('\\')) {
-                        // 查找匹配的use语句
-                        for (const useStatement of useStatements) {
-                            if (useStatement.className === globalTypeFromPhpDoc) {
-                                fullClassName = useStatement.fullPath;
-                                console.log(`全局PHPDoc类型 ${globalTypeFromPhpDoc} 解析为完整类名: ${fullClassName}`);
+                    // 检查是否包含目标方法
+                    const methodPattern = new RegExp(`function\\s+${word}\\s*\\(`, 'i');
+                    if (!methodPattern.test(content)) {
+                        continue;
+                    }
+                    
+                    // **关键：直接从代理文件名解析原始类信息**
+                    const fileName = path.basename(proxyFile.fsPath, '.php');
+                    const originalClassInfo = this.parseHyperfProxyFileName(fileName);
+                    
+                    if (!originalClassInfo) {
+                        continue;
+                    }
+                    
+                    // **直接根据解析出的类名查找原始类文件**
+                    const originalClassFile = await this.findClassFileByFullName(originalClassInfo.fullClassName);
+                    if (!originalClassFile) {
+                        continue;
+                    }
+                    
+                    // **在原始类中查找属性**
+                    const location = await this.findPropertyInFileSimple(originalClassFile, propertyName);
+                    if (location) {
+                        return location;
+                    }
+                    
+                } catch (error) {
+                    console.error(`处理代理文件 ${proxyFile.fsPath} 时出错:`, error);
+                }
+            }
+            
+            return null;
+            
+        } catch (error) {
+            console.error('方法调用跳转时出错:', error);
+            return null;
+        }
+    }
+    
+
+    /**
+     * 智能提取方法调用者信息（支持链式调用和new表达式）
+     */
+    private extractMethodCaller(document: vscode.TextDocument, position: vscode.Position, targetMethod: string): {caller: string, type: string | null} | null {
+        try {
+            const lineText = document.lineAt(position.line).text;
+            const wordStart = document.getWordRangeAtPosition(position)?.start.character || 0;
+            const beforeMethod = lineText.substring(0, wordStart);
+            
+            // 1. 检查是否是真正的链式调用 (行开始是 -> 且不在参数中)
+            if (beforeMethod.trim().endsWith('->')) {
+                // 进一步检查：确保这不是方法参数中的调用
+                const isParameterCall = this.isMethodCallInParameters(lineText, wordStart);
+                
+                if (!isParameterCall) {
+                    
+                    // 向前查找多行，寻找调用链的起始
+                    const chainStart = this.findChainCallStart(document, position);
+                    if (chainStart) {
+                        
+                        // 尝试从调用链起始推断类型
+                        const type = this.inferTypeFromChainStart(chainStart.caller, document);
+                        return {
+                            caller: chainStart.caller,
+                            type: type
+                        };
+                    } else {
+                    }
+                } else {
+                }
+            }
+            
+            // 2. 检查是否是直接调用 ($variable->method) - 支持方法参数中的调用
+            // 更灵活的匹配模式，支持参数中的调用
+            const directCallMatch = beforeMethod.match(/(\$\w+)\s*->\s*$/);
+            if (directCallMatch) {
+                const variableName = directCallMatch[1];
+                
+                const useStatements = this.extractUseStatements(document.getText());
+                const type = this.inferTypeFromVariableName(variableName, useStatements);
+                const fullType = type ? (this.resolveFullClassName(type, useStatements) || type) : null;
+                
+                return {
+                    caller: variableName,
+                    type: fullType
+                };
+            }
+            
+            // 3. 尝试从整行中提取变量调用（处理复杂情况）
+            const complexCallMatch = lineText.match(/(\$\w+)\s*->\s*\w+\s*\(/);
+            if (complexCallMatch) {
+                // 检查匹配的方法是否是当前光标所在的方法
+                const matchedVarName = complexCallMatch[1];
+                const methodPattern = new RegExp(`\\${matchedVarName}\\s*->\\s*(\\w+)\\s*\\(`);
+                const methodMatch = lineText.match(methodPattern);
+                
+                if (methodMatch && methodMatch[1] === targetMethod) {
+                    
+                    const useStatements = this.extractUseStatements(document.getText());
+                    const type = this.inferTypeFromVariableName(matchedVarName, useStatements);
+                    const fullType = type ? (this.resolveFullClassName(type, useStatements) || type) : null;
+                    
+                    return {
+                        caller: matchedVarName,
+                        type: fullType
+                    };
+                }
+            }
+            
+            return null;
+            
+        } catch (error) {
+            console.error('提取方法调用者时出错:', error);
+            return null;
+        }
+    }
+
+    /**
+     * 检查方法调用是否在参数中（而非真正的链式调用）
+     */
+    private isMethodCallInParameters(lineText: string, methodStartPos: number): boolean {
+        try {
+            
+            // 从方法位置向前查找，寻找最近的开括号和方法名
+            let pos = methodStartPos - 1;
+            let parenCount = 0;
+            let foundOpenParen = false;
+            
+            // 向前扫描寻找括号平衡
+            while (pos >= 0) {
+                const char = lineText[pos];
+                
+                if (char === ')') {
+                    parenCount++;
+                } else if (char === '(') {
+                    if (parenCount === 0) {
+                        foundOpenParen = true;
                                 break;
-                            }
-                        }
+                    } else {
+                        parenCount--;
                     }
-                    
-                    potentialTypes.push({
-                        type: globalTypeFromPhpDoc, 
-                        source: 'globalPhpDoc',
-                        fullClassName: fullClassName
-                    });
+                }
+                pos--;
+            }
+            
+            if (foundOpenParen) {
+                // 检查开括号前是否有方法调用模式
+                const beforeParen = lineText.substring(0, pos).trim();
+                
+                // 检查是否是方法调用模式: ->methodName( 或 methodName(
+                const methodCallPattern = /->\s*\w+$|^\s*\w+$/;
+                if (methodCallPattern.test(beforeParen)) {
+                    return true;
                 }
             }
             
-            // 3. 再次查找通过new实例化的类型
-            const typeFromNew = this.findObjectTypeFromNew(fullText, objectName);
-            if (typeFromNew) {
-                console.log(`通过 new 语句找到对象 ${objectName} 的类型: ${typeFromNew}`);
+            return false;
+            
+        } catch (error) {
+            console.error('检查方法调用参数时出错:', error);
+            return false;
+        }
+    }
+
+    /**
+     * 寻找链式调用的起始点
+     */
+    private findChainCallStart(document: vscode.TextDocument, position: vscode.Position): {caller: string, line: number} | null {
+        try {
+            // 从当前行向前查找，最多查找10行
+            const maxLookBack = 10;
+            const startLine = Math.max(0, position.line - maxLookBack);
+            
+            for (let lineNum = position.line; lineNum >= startLine; lineNum--) {
+                const line = document.lineAt(lineNum);
+                const lineText = line.text;
                 
-                // 解析完整类名
-                let fullClassName = typeFromNew;
-                if (!typeFromNew.includes('\\')) {
-                    // 查找匹配的use语句
-                    for (const useStatement of useStatements) {
-                        if (useStatement.className === typeFromNew) {
-                            fullClassName = useStatement.fullPath;
-                            console.log(`new类型 ${typeFromNew} 解析为完整类名: ${fullClassName}`);
+                
+                // 检查 (new ClassName()) 模式
+                const newMatch = lineText.match(/\(\s*new\s+(\w+)\s*\(\s*\)\s*\)/);
+                if (newMatch) {
+                    const className = newMatch[1];
+                    return {
+                        caller: `(new ${className}())`,
+                        line: lineNum
+                    };
+                }
+                
+                // 检查 $variable = 模式
+                const assignMatch = lineText.match(/(\$\w+)\s*=/);
+                if (assignMatch) {
+                    const variableName = assignMatch[1];
+                    return {
+                        caller: variableName,
+                        line: lineNum
+                    };
+                }
+                
+                // 检查直接的 $variable-> 模式
+                const varMatch = lineText.match(/(\$\w+)\s*->/);
+                if (varMatch && !lineText.trim().startsWith('->')) {
+                    const variableName = varMatch[1];
+                    return {
+                        caller: variableName,
+                        line: lineNum
+                    };
+                }
+                
+                // 如果行不是以 -> 开始，说明调用链已经结束
+                if (!lineText.trim().startsWith('->') && lineNum < position.line) {
                             break;
                         }
-                    }
-                }
-                
-                potentialTypes.push({
-                    type: typeFromNew, 
-                    source: 'new',
-                    fullClassName: fullClassName
-                });
             }
             
-            // 4. 最后查找函数参数类型提示
-            const typeFromParam = this.findObjectTypeFromFunctionParams(fullText, objectName);
-            if (typeFromParam) {
-                console.log(`从函数参数中找到 ${objectName} 的类型: ${typeFromParam}`);
+            return null;
+        } catch (error) {
+            console.error('寻找链式调用起始时出错:', error);
+            return null;
+        }
+    }
+
+    /**
+     * 从调用链起始推断类型
+     */
+    private inferTypeFromChainStart(caller: string, document: vscode.TextDocument): string | null {
+        try {
+            
+            // 1. 处理 (new ClassName()) 模式
+            const newMatch = caller.match(/\(\s*new\s+(\w+)\s*\(\s*\)\s*\)/);
+            if (newMatch) {
+                const className = newMatch[1];
                 
                 // 解析完整类名
-                let fullClassName = typeFromParam;
-                if (!typeFromParam.includes('\\')) {
-                    // 查找匹配的use语句
-                    for (const useStatement of useStatements) {
-                        if (useStatement.className === typeFromParam) {
-                            fullClassName = useStatement.fullPath;
-                            console.log(`参数类型 ${typeFromParam} 解析为完整类名: ${fullClassName}`);
-                            break;
-                        }
-                    }
-                }
-                
-                potentialTypes.push({
-                    type: typeFromParam, 
-                    source: 'param',
-                    fullClassName: fullClassName
-                });
+                const useStatements = this.extractUseStatements(document.getText());
+                const fullClassName = this.resolveFullClassName(className, useStatements) || className;
+                return fullClassName;
             }
             
-            // 如果没有找到任何类型，返回null
-            if (potentialTypes.length === 0) {
-                console.log(`未找到 ${objectName} 的类型信息`);
+            // 2. 处理 $variable 模式
+            if (caller.startsWith('$')) {
+                const useStatements = this.extractUseStatements(document.getText());
+                const type = this.inferTypeFromVariableName(caller, useStatements);
+                const fullType = type ? (this.resolveFullClassName(type, useStatements) || type) : null;
+                return fullType;
+            }
+            
+            return null;
+            
+        } catch (error) {
+            console.error('从调用链起始推断类型时出错:', error);
+                return null;
+        }
+    }
+
+    /**
+     * 根据目标类名查找对应的属性位置
+     */
+    private async findPropertyByTargetClass(fullClassName: string, propertyName: string): Promise<vscode.Location | null> {
+        try {
+            
+            // 构建期望的代理文件名
+            const expectedProxyName = this.buildProxyFileNameFromClassName(fullClassName);
+            
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
                 return null;
             }
             
-            // 对每个可能的类型，尝试查找属性
-            for (const typeInfo of potentialTypes) {
-                const fullClassName = typeInfo.fullClassName || typeInfo.type;
-                console.log(`尝试在类型 ${typeInfo.type} (${typeInfo.source}) 查找属性 ${propertyName}`);
+            const workspaceRoot = workspaceFolders[0].uri.fsPath;
+            const proxyDir = path.join(workspaceRoot, '.php-accessor', 'proxy', 'accessor');
+            
+            if (!fs.existsSync(proxyDir)) {
+                return null;
+            }
+            
+            // 检查期望的代理文件是否存在
+            const expectedProxyPath = path.join(proxyDir, expectedProxyName);
+            if (fs.existsSync(expectedProxyPath)) {
                 
-                // 尝试查找类文件
-                const classFile = await this.findClassFileFromNamespaceFast(fullClassName);
+                // 直接查找原始类文件
+                const originalClassFile = await this.findClassFileByFullName(fullClassName);
+                if (!originalClassFile) {
+                    return null;
+                }
                 
-                if (classFile) {
-                    // 提取简短类名用于属性搜索
-                    const shortClassName = fullClassName.split('\\').pop() || typeInfo.type;
+                
+                // 解析NamingConvention并生成属性名变体
+                let namingConvention = 2; // 默认 LOWER_CAMEL_CASE
+                try {
+                    const classContent = fs.readFileSync(originalClassFile, 'utf8');
+                    namingConvention = this.parseNamingConvention(classContent);
+                    const conventionNames: Record<number, string> = {1: 'NONE', 2: 'LOWER_CAMEL_CASE', 3: 'UPPER_CAMEL_CASE'};
+                } catch (error) {
+                }
+                
+                // 生成可能的属性名变体
+                const methodName = propertyName.substring(0, 1).toUpperCase() + propertyName.substring(1);
+                const propertyNameVariants = this.generatePropertyNameVariants('get' + methodName, namingConvention);
+                
+                // 逐个尝试搜索候选属性名
+                for (let i = 0; i < propertyNameVariants.length; i++) {
+                    const candidateName = propertyNameVariants[i];
                     
-                    console.log(`找到类文件: ${classFile}, 准备查找属性: ${propertyName}`);
-                    
-                    // 查找属性, 确保查找原始类中的属性
-                    const result = await this.findPropertyInFile(
-                        classFile, 
-                        shortClassName, 
-                        propertyName, 
-                        cacheKey, 
-                        classPropertyCache,
-                        true // 强制使用原始类而非代理类
-                    );
-                    
-                    if (result) {
-                        console.log(`成功在类型 ${typeInfo.type} (${typeInfo.source}) 中找到属性 ${propertyName}`);
-                        return result;
+                    const location = await this.findPropertyInFileSimple(originalClassFile, candidateName);
+                    if (location) {
+                        return location;
                     } else {
-                        console.log(`在类型 ${typeInfo.type} (${typeInfo.source}) 中未找到属性 ${propertyName}`);
                     }
+                }
+                
                 } else {
-                    console.log(`未找到类型 ${typeInfo.type} 的类文件`);
+                
+                // 直接在原始类文件中查找属性（无代理文件的情况）
+                const directLocation = await this.findPropertyInOriginalClass(fullClassName, propertyName);
+                if (directLocation) {
+                    return directLocation;
+                } else {
                 }
             }
             
-            // 如果从所有类型中都未找到属性，尝试基于属性名查找可能的类（更通用的方法）
-            console.log(`从所有已知类型中未找到属性 ${propertyName}，尝试基于属性名搜索...`);
-            
-            const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
-            if (!workspaceFolder) return null;
-            
-            // 优化：限制搜索范围到几个可能的目录
-            const commonDirs = [
-                'app/Domain',
-                'app/Entity',
-                'src/Domain',
-                'src/Entity',
-                'domain',
-                'entity',
-                'app/Models',
-                'src/Models',
-                'models',
-                'app/Infrastructure',
-                'src/Infrastructure'
-            ];
-            
-            for (const dir of commonDirs) {
-                const basePath = path.join(workspaceFolder.uri.fsPath, dir);
-                if (!fs.existsSync(basePath)) continue;
-                
-                // 快速搜索可能的PHP文件
-                const phpFiles = await this.quickFindPhpFilesWithProperty(basePath, propertyName);
-                
-                for (const phpFile of phpFiles) {
-                    try {
-                        const fileDoc = await vscode.workspace.openTextDocument(vscode.Uri.file(phpFile));
-                        const fileContent = fileDoc.getText();
-                        
-                        // 检查文件是否包含该属性
-                        const propertyRegex = new RegExp(`(public|protected|private)\\s+(?:readonly\\s+)?(?:\\w+\\s+)?\\$${propertyName}\\b`, 'g');
-                        const match = propertyRegex.exec(fileContent);
-                        
-                        if (match) {
-                            // 提取类名用于日志
-                            const classMatch = fileContent.match(/class\s+(\w+)/);
-                            const className = classMatch ? classMatch[1] : path.basename(phpFile, '.php');
-                            
-                            console.log(`通过属性名匹配找到属性 ${propertyName} 在类 ${className}`);
-                            
-                            const propertyPos = fileDoc.positionAt(match.index);
-                            return new vscode.Location(vscode.Uri.file(phpFile), propertyPos);
-                        }
-                    } catch (error) {
-                        // 不中断流程，继续尝试下一个文件
-                        continue;
-                    }
-                }
-            }
-            
-            console.log(`未能找到属性 ${propertyName} 的任何匹配`);
             return null;
         } catch (error) {
-            console.error('跳转到属性时出错:', error);
+            console.error('根据类名查找属性时出错:', error);
+            return null;
+        }
+    }
+
+    /**
+     * 直接在原始类中查找属性（无代理文件时）
+     */
+    private async findPropertyInOriginalClass(fullClassName: string, propertyName: string): Promise<vscode.Location | null> {
+        try {
+            
+            // 1. 找到原始类文件
+            const originalClassFile = await this.findClassFileByFullName(fullClassName);
+            if (!originalClassFile) {
+                return null;
+            }
+            
+            
+            // 2. 解析命名约定（如果有的话）
+            let namingConvention = 1; // 默认 NONE，因为这些类可能没有注解
+            let propertyNameVariants: string[] = [];
+            
+            try {
+                const classContent = fs.readFileSync(originalClassFile, 'utf8');
+                
+                // 检查是否有命名约定注解
+                const hasDataAnnotation = classContent.includes('#[Data') || classContent.includes('#[HyperfData]');
+                if (hasDataAnnotation) {
+                    namingConvention = this.parseNamingConvention(classContent);
+                    const conventionNames: Record<number, string> = {1: 'NONE', 2: 'LOWER_CAMEL_CASE', 3: 'UPPER_CAMEL_CASE'};
+                } else {
+                }
+                
+                // 生成属性名变体
+                const methodName = propertyName.substring(0, 1).toUpperCase() + propertyName.substring(1);
+                propertyNameVariants = this.generatePropertyNameVariants('get' + methodName, namingConvention);
+                
+                // 对于无注解的类，还要尝试原始属性名
+                if (!hasDataAnnotation) {
+                    propertyNameVariants.unshift(propertyName); // 优先尝试原始属性名
+                }
+                
+                
+            } catch (error) {
+                propertyNameVariants = [propertyName, propertyName.toLowerCase()];
+            }
+            
+            // 3. 逐个尝试搜索候选属性名
+            for (let i = 0; i < propertyNameVariants.length; i++) {
+                const candidateName = propertyNameVariants[i];
+                
+                const location = await this.findPropertyInFileSimple(originalClassFile, candidateName);
+                if (location) {
+                    return location;
+                } else {
+                }
+            }
+            
+            return null;
+            
+                    } catch (error) {
+            console.error('直接在原始类中查找属性时出错:', error);
+            return null;
+        }
+    }
+
+    /**
+     * 根据类全名构建代理文件名
+     */
+    private buildProxyFileNameFromClassName(fullClassName: string): string {
+        // App\Interfaces\Dto\Access\ProductDTO -> _Proxy_App_Interfaces_Dto_Access_ProductDTOAccessor.php
+        const namespaceSegments = fullClassName.split('\\');
+        const proxyName = '_Proxy_' + namespaceSegments.join('_') + 'Accessor.php';
+        return proxyName;
+    }
+
+    /**
+     * 根据完整类名查找类文件 - 简化版本
+     */
+    private async findClassFileByFullName(fullClassName: string): Promise<string | null> {
+        try {
+            
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
+            return null;
+            }
+            
+            const workspaceRoot = workspaceFolders[0].uri.fsPath;
+            
+            // 将命名空间转换为文件路径
+            // App\Interfaces\Dto\Access\ProductDTO → app/Interfaces/Dto/Access/ProductDTO.php
+            const classPath = fullClassName.replace(/\\/g, '/');
+            
+            // 尝试常见的PSR-4路径模式
+            const possiblePaths = [
+                path.join(workspaceRoot, 'app', classPath + '.php'),           // app/App/Interfaces/...
+                path.join(workspaceRoot, classPath + '.php'),                 // App/Interfaces/...
+                path.join(workspaceRoot, 'src', classPath + '.php'),          // src/App/Interfaces/...
+                path.join(workspaceRoot, 'app', classPath.substring(4) + '.php'), // app/Interfaces/... (去掉App/)
+            ];
+            
+            for (const filePath of possiblePaths) {
+                if (fs.existsSync(filePath)) {
+                    return filePath;
+                }
+            }
+            
+            return null;
+            
+        } catch (error) {
+            console.error(`查找类文件时出错: ${fullClassName}`, error);
             return null;
         }
     }
     
     /**
-     * 快速查找可能包含指定属性的PHP文件
-     * 使用文件系统API直接查找，而不是vscode的findFiles (性能显著提升)
+     * 策略1: 通过代理类文件查找属性
+     * 在项目中搜索包含目标方法的代理trait，然后追溯到原始类
      */
-    private async quickFindPhpFilesWithProperty(dirPath: string, propertyName: string, maxFiles: number = 20): Promise<string[]> {
+    private async findPropertyViaProxyFiles(methodName: string, propertyName: string): Promise<vscode.Location | null> {
         try {
-            const result: string[] = [];
-            const queue: string[] = [dirPath];
             
-            // 广度优先搜索，查找可能包含属性的PHP文件
-            while (queue.length > 0 && result.length < maxFiles) {
-                const currentDir = queue.shift();
-                if (!currentDir) continue;
-                
-                const items = fs.readdirSync(currentDir);
-                
-                for (const item of items) {
-                    if (result.length >= maxFiles) break;
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders || workspaceFolders.length === 0) {
+                return null;
+            }
+            
+            // 使用直接文件系统搜索代理文件
+            const workspaceRoot = workspaceFolders[0].uri.fsPath;
+            const proxyDir = path.join(workspaceRoot, '.php-accessor', 'proxy', 'accessor');
+            
+            let proxyFiles: vscode.Uri[] = [];
+            if (fs.existsSync(proxyDir)) {
+                const files = fs.readdirSync(proxyDir)
+                    .filter(file => file.endsWith('Accessor.php'))
+                    .map(file => vscode.Uri.file(path.join(proxyDir, file)));
+                proxyFiles = files;
+            } else {
+                // 回退到vscode搜索
+                proxyFiles = await vscode.workspace.findFiles(
+                    '**/.php-accessor/proxy/accessor/*Accessor.php',
+                    '**/vendor/**'
+                );
+            }
+            
+            
+            for (const proxyFile of proxyFiles) {
+                try {
+                    const content = fs.readFileSync(proxyFile.fsPath, 'utf8');
                     
-                    const itemPath = path.join(currentDir, item);
-                    const stats = fs.statSync(itemPath);
+                    // 检查是否包含目标方法
+                    const methodPattern = new RegExp(`function\\s+${methodName}\\s*\\(`, 'i');
+                    if (!methodPattern.test(content)) {
+                        continue;
+                    }
                     
-                    if (stats.isDirectory() && !itemPath.includes('vendor') && !itemPath.includes('.php-accessor')) {
-                        queue.push(itemPath);
-                    } else if (stats.isFile() && itemPath.endsWith('.php')) {
-                        // 快速内容检查 - 仅读取文件一次并检查是否包含属性模式
-                        try {
-                            const content = fs.readFileSync(itemPath, 'utf8');
-                            // 简单字符串检查比正则表达式快
-                            if (content.includes(`$${propertyName}`) && 
-                                (content.includes('public') || content.includes('protected') || content.includes('private'))) {
-                                result.push(itemPath);
-                            }
-                        } catch (e) {
-                            // 忽略文件读取错误，继续下一个
+                    
+                    // 从代理文件名解析原始类信息
+                    const fileName = path.basename(proxyFile.fsPath, '.php');
+                    const originalClassInfo = this.parseHyperfProxyFileName(fileName);
+                    
+                    if (!originalClassInfo) {
                             continue;
                         }
+                    
+                    
+                    // 尝试加载对应的meta文件获取精确属性映射
+                    const propertyMapping = await this.loadPropertyMappingFromMeta(proxyFile.fsPath, methodName);
+                    
+                    // 查找原始类文件
+                    const originalClassFile = await this.findOriginalClassFromNamespace(originalClassInfo);
+                    if (!originalClassFile) {
+                        continue;
                     }
+                    
+                    
+                    // 读取原始类内容并解析命名约定
+                    const originalContent = fs.readFileSync(originalClassFile, 'utf8');
+                    const namingConvention = this.parseNamingConvention(originalContent);
+                    
+                    // 生成可能的属性名，优先使用meta映射
+                    let propertyNameVariants = this.generatePropertyNameVariants(methodName, namingConvention);
+                    
+                    // 如果有meta映射，优先使用
+                    if (propertyMapping && propertyMapping.fieldName) {
+                        propertyNameVariants = [propertyMapping.fieldName, ...propertyNameVariants];
+                    }
+                    
+                    
+                    // 在原始类中查找属性
+                    for (let i = 0; i < propertyNameVariants.length; i++) {
+                        const candidatePropertyName = propertyNameVariants[i];
+                        
+                        const location = await this.findPropertyInFileSimple(originalClassFile, candidatePropertyName);
+                        if (location) {
+                            return location;
+                        } else {
+                        }
+                    }
+                    
+        } catch (error) {
+                    console.error(`处理代理文件 ${proxyFile.fsPath} 时出错:`, error);
                 }
             }
             
-            return result;
+            return null;
+            
         } catch (error) {
-            console.error('Error in quick find:', error);
-            return [];
+            console.error('通过代理文件查找属性时出错:', error);
+            return null;
+        }
+    }
+    
+    /**
+     * 策略2: 通过变量名推断类型查找属性
+     */
+    private async findPropertyViaVariableName(
+        document: vscode.TextDocument, 
+        lineText: string, 
+        methodName: string, 
+        propertyName: string
+    ): Promise<vscode.Location | null> {
+        try {
+            
+            // 提取变量名 (例如: $productDTO->getAccessNo() 提取出 $productDTO)
+            const variableMatch = lineText.match(/(\$\w+)\s*->\s*\w+/);
+            if (!variableMatch) {
+                return null;
+            }
+            
+            const variableName = variableMatch[1];
+            
+            // 从变量名推断类型
+            const documentText = document.getText();
+            const useStatements = this.extractUseStatements(documentText);
+            
+            // 尝试不同的类型推断方法
+            const inferredTypes: Array<{type: string, source: string, confidence: number}> = [];
+            
+            // 1. 从变量名直接推断
+            const typeFromVarName = this.inferTypeFromVariableName(variableName, useStatements);
+            if (typeFromVarName) {
+                const fullClassName = this.resolveFullClassName(typeFromVarName, useStatements);
+                inferredTypes.push({
+                    type: fullClassName || typeFromVarName,
+                    source: 'variableName',
+                    confidence: 0.9
+                });
+            }
+            
+            // 2. 从new语句推断
+            const typeFromNew = this.findObjectTypeFromNew(documentText, variableName);
+            if (typeFromNew) {
+                const fullClassName = this.resolveFullClassName(typeFromNew, useStatements);
+                inferredTypes.push({
+                    type: fullClassName || typeFromNew,
+                    source: 'newStatement',
+                    confidence: 0.95
+                });
+            }
+            
+            // 3. 从PHPDoc推断
+            const position = document.positionAt(document.getText().indexOf(lineText));
+            const typeFromDoc = await this.findTypeFromNearestPhpDoc(document, position.line, variableName);
+            if (typeFromDoc) {
+                const fullClassName = this.resolveFullClassName(typeFromDoc, useStatements);
+                inferredTypes.push({
+                    type: fullClassName || typeFromDoc,
+                    source: 'phpDoc',
+                    confidence: 0.85
+                });
+            }
+            
+            if (inferredTypes.length === 0) {
+                return null;
+            }
+            
+            // 按置信度排序
+            inferredTypes.sort((a, b) => b.confidence - a.confidence);
+            
+            // 对每个推断的类型，尝试查找属性
+            for (const typeInfo of inferredTypes) {
+                
+                // 查找类文件
+                const classFile = await this.findClassFileFromNamespaceWithCache(typeInfo.type);
+                if (!classFile) {
+                            continue;
+                        }
+                
+                
+                // 严格验证：确保这是正确的类
+                if (!await this.isStrictValidClass(classFile, typeInfo.type, propertyName, variableName)) {
+                    continue;
+                }
+                
+                // 在类中查找属性
+                const location = await this.findPropertyInFileSimple(classFile, propertyName);
+                if (location) {
+                    return location;
+                }
+            }
+            
+            return null;
+            
+        } catch (error) {
+            console.error('通过变量名推断查找属性时出错:', error);
+            return null;
+        }
+    }
+    
+    /**
+     * 简化的属性查找方法
+     */
+    private async findPropertyInFileSimple(filePath: string, propertyName: string): Promise<vscode.Location | null> {
+        try {
+            const content = fs.readFileSync(filePath, 'utf8');
+            const lines = content.split('\n');
+            
+            // 查找属性定义
+            const propertyPattern = new RegExp(`(public|protected|private)\\s+(?:readonly\\s+)?(?:\\w+\\s+)?\\$${propertyName}\\b`);
+            
+            for (let i = 0; i < lines.length; i++) {
+                if (propertyPattern.test(lines[i])) {
+                    const uri = vscode.Uri.file(filePath);
+                    const position = new vscode.Position(i, 0);
+                    return new vscode.Location(uri, position);
+                }
+            }
+            
+            return null;
+        } catch (error) {
+            console.error(`查找属性 ${propertyName} 时出错:`, error);
+            return null;
+        }
+    }
+    
+    /**
+     * 严格的类验证
+     */
+    private async isStrictValidClass(classFile: string, fullClassName: string, propertyName: string, variableName: string): Promise<boolean> {
+        try {
+            const content = fs.readFileSync(classFile, 'utf8');
+            
+            // 1. 必须包含该属性
+            const propertyPattern = new RegExp(`(public|protected|private)\\s+(?:\\w+\\s+)?\\$${propertyName}\\b`);
+            if (!propertyPattern.test(content)) {
+                return false;
+            }
+            
+            // 2. 类名必须匹配
+            const className = fullClassName.split('\\').pop();
+            if (!className) {
+                return false;
+            }
+            
+            const classPattern = new RegExp(`class\\s+${className}\\b`);
+            if (!classPattern.test(content)) {
+                return false;
+            }
+            
+            // 3. 变量名和类名应该相关
+            const varName = variableName.replace('$', '').toLowerCase();
+            const lowerClassName = className.toLowerCase();
+            
+            // 高度相关的命名模式
+            if (varName.includes(lowerClassName) || lowerClassName.includes(varName)) {
+                return true;
+            }
+            
+            // DTO特殊模式
+            if (varName.includes('dto') && lowerClassName.includes('dto')) {
+                return true;
+            }
+            
+            // 如果变量名不匹配，严格检查
+            
+            // 拒绝明显错误的匹配
+            const suspiciousPatterns = ['invitation', 'assembler', 'service', 'controller'];
+            for (const pattern of suspiciousPatterns) {
+                if (lowerClassName.includes(pattern) && !varName.includes(pattern)) {
+                    return false;
+                }
+            }
+            
+            return true;
+        } catch (error) {
+            console.error('验证类时出错:', error);
+            return false;
         }
     }
     
@@ -675,7 +1555,6 @@ export class AccessorNavigator {
                 return null;
             }
             
-            console.log(`尝试查找类文件: ${namespace}`);
             const workspaceRoot = workspaceFolders[0].uri.fsPath;
             
             // 从命名空间创建可能的文件路径
@@ -718,7 +1597,7 @@ export class AccessorNavigator {
                         if (content.includes(`class ${className}`) || 
                             content.includes(`abstract class ${className}`) || 
                             content.includes(`final class ${className}`)) {
-                            console.log(`找到类文件: ${filePath}`);
+
                             return filePath;
                         }
                     } catch (e) {
@@ -728,7 +1607,6 @@ export class AccessorNavigator {
             }
             
             // 如果找不到精确的类路径，尝试基于类名在整个项目中搜索
-            console.log(`未找到精确路径，使用模糊搜索查找类: ${className}`);
             const searchPattern = `**/${className}.php`;
             const files = await vscode.workspace.findFiles(
                 searchPattern,
@@ -753,12 +1631,10 @@ export class AccessorNavigator {
                         if (namespaceSegments.length > 0) {
                             const nsPattern = new RegExp(`namespace\\s+${namespaceSegments.join('\\\\')}\\b`);
                             if (nsPattern.test(content)) {
-                                console.log(`通过完整命名空间匹配找到类: ${file.fsPath}`);
                                 return file.fsPath;
                             }
                         } else {
                             // 没有命名空间要求，直接返回找到的第一个匹配文件
-                            console.log(`通过类名模式匹配找到类: ${file.fsPath}`);
                             return file.fsPath;
                         }
                     }
@@ -782,7 +1658,6 @@ export class AccessorNavigator {
                         if (content.includes(`class ${className}`) || 
                             content.includes(`abstract class ${className}`) || 
                             content.includes(`final class ${className}`)) {
-                            console.log(`通过模糊搜索找到类: ${file.fsPath}`);
                             return file.fsPath;
                         }
                     } catch (e) {
@@ -791,7 +1666,6 @@ export class AccessorNavigator {
                 }
             }
             
-            console.log(`未找到类 ${namespace} 的文件`);
             return null;
         } catch (error) {
             console.error('查找类文件时出错:', error);
@@ -829,7 +1703,6 @@ export class AccessorNavigator {
                     const fullMatch = match[0];
                     // 如果注释包含变量名或者不包含任何$变量（通用注释）
                     if (fullMatch.includes(`$${varName}`) || !fullMatch.includes('$')) {
-                        console.log(`在 "${fullMatch}" 中找到类型: ${match[1].trim()}`);
                         return match[1].trim();
                     }
                 }
@@ -887,6 +1760,14 @@ export class AccessorNavigator {
      * 从new语句中查找对象类型
      */
     private findObjectTypeFromNew(text: string, objectName: string): string | null {
+        // 处理 (new ClassName()) 直接实例化的情况
+        if (objectName.startsWith('(new ') && objectName.endsWith('())')) {
+            const classNameMatch = objectName.match(/\(new\s+([A-Za-z_][A-Za-z0-9_\\]*)\s*\(\s*\)\s*\)/);
+            if (classNameMatch && classNameMatch[1]) {
+                return classNameMatch[1].trim();
+            }
+        }
+        
         // 移除objectName中的$前缀以便于正则匹配
         const varName = objectName.replace('$', '');
         
@@ -1093,7 +1974,6 @@ export class AccessorNavigator {
                 return null;
             }
             
-            console.log(`在文件 ${filePath} 中查找属性 ${propertyName}`);
             
             // 读取文件内容
             const fileDoc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
@@ -1121,7 +2001,6 @@ export class AccessorNavigator {
             }
             
             if (!classFound) {
-                console.log(`文件 ${filePath} 中未找到类 ${className}`);
                 return null;
             }
             
@@ -1189,7 +2068,6 @@ export class AccessorNavigator {
                     }
                     classPropertyCache.get(cacheKey)?.set(propertyName, location);
                     
-                    console.log(`在文件 ${filePath} 中找到属性 ${propertyName} 在位置 ${propertyPos.line}:${propertyPos.character}`);
                     return location;
                 }
             }
@@ -1198,7 +2076,6 @@ export class AccessorNavigator {
             const extendsMatch = classContent.match(/extends\s+([\w\\]+)/);
             if (extendsMatch && extendsMatch[1]) {
                 const parentClass = extendsMatch[1];
-                console.log(`在当前类未找到属性，尝试在父类 ${parentClass} 中查找`);
                 
                 // 如果父类包含命名空间，尝试解析完整路径
                 if (parentClass.includes('\\')) {
@@ -1235,7 +2112,6 @@ export class AccessorNavigator {
                 }
             }
             
-            console.log(`在文件 ${filePath} 中未找到属性 ${propertyName}`);
             return null;
         } catch (error) {
             console.error(`在文件 ${filePath} 中搜索属性 ${propertyName} 时出错:`, error);
@@ -1488,7 +2364,6 @@ export class AccessorNavigator {
                     }
                 }
                 
-                console.log(`变量 ${variableName} 的类型: ${fullClassName}`);
                 
                 // 查找类文件
                 const classFile = await this.findClassFileFromNamespaceFast(fullClassName);
@@ -1678,6 +2553,768 @@ export class AccessorNavigator {
                     return null;
                 }
             }
+        };
+    }
+
+    /**
+     * 从最近的PHPDoc注释中查找类型（增强版）
+     */
+    private async findTypeFromNearestPhpDoc(document: vscode.TextDocument, lineIndex: number, objectName: string): Promise<string | null> {
+        const maxLinesToSearch = 15;
+        let searchLine = lineIndex - 1;
+        
+        while (searchLine >= 0 && searchLine >= lineIndex - maxLinesToSearch) {
+            const searchText = document.lineAt(searchLine).text.trim();
+            
+            // 检查是否包含@var注释
+            if (searchText.includes('@var') || searchText.includes('* @var')) {
+                // 提取上下文
+                const contextStart = Math.max(0, searchLine - 3);
+                const contextEnd = Math.min(document.lineCount - 1, searchLine + 3);
+                const contextLines = [];
+                
+                for (let i = contextStart; i <= contextEnd; i++) {
+                    contextLines.push(document.lineAt(i).text);
+                }
+                
+                const contextText = contextLines.join('\n');
+                const type = this.findObjectTypeFromVarAnnotationEnhanced(contextText, objectName);
+                
+                if (type) {
+                    return type;
+                }
+            }
+            
+            // 检查是否是赋值语句
+            if (searchText.includes(objectName) && searchText.includes('=')) {
+                // 向上查找可能的PHPDoc注释
+                for (let i = searchLine - 1; i >= Math.max(0, searchLine - 5); i--) {
+                    const prevLine = document.lineAt(i).text.trim();
+                    if (prevLine.includes('@var')) {
+                        const type = this.findObjectTypeFromVarAnnotationEnhanced(prevLine, objectName);
+                        if (type) {
+                            return type;
+                        }
+                    }
+                }
+            }
+            
+            // 如果遇到代码块结束或函数开始，停止搜索
+            if (searchText === '}' || searchText.includes('function ')) {
+                break;
+            }
+            
+            searchLine--;
+        }
+        
+        // 如果局部搜索没有结果，尝试全局搜索
+        const fullText = document.getText();
+        return this.findObjectTypeFromVarAnnotationEnhanced(fullText, objectName);
+    }
+    
+    /**
+     * 从@var注释中查找对象类型（增强版）
+     */
+    private findObjectTypeFromVarAnnotationEnhanced(text: string, objectName: string): string | null {
+        // 去掉$符号，用于正则匹配
+        const varName = objectName.replace('$', '');
+
+        // 更强大的正则表达式，匹配各种PHPDoc @var注释格式
+        const patterns = [
+            // 1. 匹配精确的 @var ClassName $varName 格式
+            new RegExp(`@var\\s+([\\w\\\\]+)\\s+\\$${varName}\\b`, 'g'),
+            
+            // 2. 匹配 /* @var ClassName $varName */ 格式
+            new RegExp(`/\\*\\s*@var\\s+([\\w\\\\]+)\\s+\\$${varName}\\s*\\*/`, 'g'),
+            
+            // 3. 匹配多行PHPDoc格式 /** @var ClassName $varName */
+            new RegExp(`/\\*\\*[\\s\\S]*?@var\\s+([\\w\\\\]+)\\s+\\$${varName}[\\s\\S]*?\\*/`, 'g'),
+            
+            // 4. 匹配行内注释: // @var ClassName $varName
+            new RegExp(`//\\s*@var\\s+([\\w\\\\]+)\\s+\\$${varName}\\b`, 'g'),
+            
+            // 5. 匹配更宽松的格式（不包含变量名的@var）
+            new RegExp(`@var\\s+([\\w\\\\]+)(?!\\s+\\$\\w)`, 'g')
+        ];
+        
+        // 先尝试精确匹配（包含变量名的）
+        for (let i = 0; i < 4; i++) {
+            const pattern = patterns[i];
+            let match;
+            pattern.lastIndex = 0; // 重置正则表达式状态
+            
+            while ((match = pattern.exec(text)) !== null) {
+                if (match && match[1]) {
+                    const fullMatch = match[0];
+                    return match[1].trim();
+                }
+            }
+        }
+        
+        // 如果精确匹配失败，尝试宽松匹配
+        // 查找最近的@var注释，然后检查上下文
+        const lines = text.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.includes('@var')) {
+                const match = line.match(/@var\s+([\w\\]+)/);
+                if (match && match[1]) {
+                    // 检查后续几行是否包含目标变量
+                    for (let j = i; j < Math.min(i + 5, lines.length); j++) {
+                        if (lines[j].includes(objectName)) {
+                            return match[1].trim();
+                        }
+                    }
+                }
+            }
+        }
+        
+        return null;
+    }
+    
+    /**
+     * 解析完整类名
+     */
+    private resolveFullClassName(typeName: string, useStatements: Array<{fullPath: string, className: string}>): string {
+        if (typeName.includes('\\')) {
+            return typeName;
+        }
+        
+        for (const useStatement of useStatements) {
+            if (useStatement.className === typeName) {
+                return useStatement.fullPath;
+            }
+        }
+        
+        return typeName;
+    }
+    
+    /**
+     * 增强的类文件查找（带缓存）
+     */
+    private async findClassFileFromNamespaceWithCache(namespace: string): Promise<string | null> {
+        if (this.classFileCache.has(namespace)) {
+            return this.classFileCache.get(namespace) || null;
+        }
+        
+        const result = await this.findClassFileFromNamespaceFast(namespace);
+        this.classFileCache.set(namespace, result);
+        
+        // 限制缓存大小，避免内存泄漏
+        if (this.classFileCache.size > 100) {
+            const firstKey = this.classFileCache.keys().next().value;
+            if (firstKey) {
+                this.classFileCache.delete(firstKey);
+            }
+        }
+        
+        return result;
+    }
+    
+    /**
+     * 验证类是否适合当前属性查找上下文
+     */
+    private async validateClassForProperty(
+        classFile: string, 
+        fullClassName: string, 
+        propertyName: string, 
+        objectName: string,
+        document: vscode.TextDocument
+    ): Promise<boolean> {
+        try {
+            const content = fs.readFileSync(classFile, 'utf8');
+            
+            // 1. 检查类是否确实包含该属性
+            const propertyPattern = new RegExp(`(public|protected|private)\\s+(?:readonly\\s+)?(?:\\w+\\s+)?\\$${propertyName}\\b`);
+            if (!propertyPattern.test(content)) {
+                return false;
+            }
+            
+            // 2. 检查类名是否匹配
+            const className = fullClassName.split('\\').pop();
+            if (!className) {
+                return false;
+            }
+            const classPattern = new RegExp(`class\\s+${className}\\b`);
+            if (!classPattern.test(content)) {
+                return false;
+            }
+            
+            // 3. 如果有命名空间，验证命名空间
+            if (fullClassName.includes('\\')) {
+                const namespace = fullClassName.substring(0, fullClassName.lastIndexOf('\\'));
+                const namespacePattern = new RegExp(`namespace\\s+${namespace.replace(/\\/g, '\\\\')}\\b`);
+                if (!namespacePattern.test(content)) {
+                    return false;
+                }
+            }
+            
+            // 4. 强化的变量名匹配验证
+            const varName = objectName.replace('$', '');
+            const isStrongNameMatch = this.isStrongVariableNameMatch(varName, className);
+            if (isStrongNameMatch) {
+                return true; // 变量名强匹配，直接通过
+            }
+            
+            // 5. 上下文相关性检查 - 检查当前文档是否导入了这个类
+            const documentText = document.getText();
+            const useStatements = this.extractUseStatements(documentText);
+            
+            // 如果当前文档有use语句，优先考虑已导入的类
+            if (useStatements.length > 0) {
+                const isImported = useStatements.some(use => 
+                    use.fullPath === fullClassName || use.className === className
+                );
+                
+                if (isImported) {
+                    return true;
+                }
+                
+                // 如果类没有被导入且变量名不匹配，严格检查
+                if (!isStrongNameMatch) {
+                    
+                    // 特别严格验证：避免AccessInvitation/AccessAssembler这类错误匹配
+                    if (this.isLikelyIncorrectClassMatch(className, varName, fullClassName)) {
+                        return false;
+                    }
+                    
+                    return this.performStrictValidation(classFile, propertyName, varName, className, documentText);
+                }
+            }
+            
+            return true;
+        } catch (error) {
+            console.error('验证类时出错:', error);
+            return false;
+        }
+    }
+    
+    /**
+     * 检测可能的错误类匹配 (如AccessInvitation, AccessAssembler)
+     */
+    private isLikelyIncorrectClassMatch(className: string, varName: string, fullClassName: string): boolean {
+        const lowerClassName = className.toLowerCase();
+        const lowerVarName = varName.toLowerCase();
+        
+        // 排除常见的错误匹配模式
+        const incorrectPatterns = [
+            'invitation', 'assembler', 'service', 'controller', 'entity'
+        ];
+        
+        // 如果类名包含这些词，但变量名明显不匹配，则可能是错误匹配
+        for (const pattern of incorrectPatterns) {
+            if (lowerClassName.includes(pattern) && !lowerVarName.includes(pattern)) {
+                // 进一步检查：如果变量名是DTO格式，但类名不是DTO，可能有问题
+                if (lowerVarName.includes('dto') && !lowerClassName.includes('dto')) {
+                    return true;
+                }
+                
+                // 如果命名空间差异很大，也可能有问题
+                if (fullClassName.includes('\\Entity\\') && lowerVarName.includes('dto')) {
+                    return true;
+                }
+                if (fullClassName.includes('\\Dto\\') && !lowerVarName.includes('dto')) {
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * 检查变量名与类名是否强匹配
+     */
+    private isStrongVariableNameMatch(varName: string, className: string): boolean {
+        const lowerVarName = varName.toLowerCase();
+        const lowerClassName = className.toLowerCase();
+        
+        // 直接匹配：$productDTO -> ProductDTO
+        if (lowerVarName === lowerClassName) {
+            return true;
+        }
+        
+        // DTO模式匹配：$productDTO -> ProductDTO
+        if (lowerVarName.endsWith('dto') && lowerClassName.endsWith('dto')) {
+            const varBase = lowerVarName.slice(0, -3);
+            const classBase = lowerClassName.slice(0, -3);
+            if (varBase === classBase) {
+                return true;
+            }
+        }
+        
+        // 部分匹配但高相关性：$product -> ProductDTO (80%以上相似度)
+        if (lowerClassName.includes(lowerVarName) || lowerVarName.includes(lowerClassName)) {
+            const similarity = this.calculateStringSimilarity(lowerVarName, lowerClassName);
+            if (similarity > 0.8) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * 计算字符串相似度
+     */
+    private calculateStringSimilarity(str1: string, str2: string): number {
+        if (str1 === str2) return 1.0;
+        
+        const longer = str1.length > str2.length ? str1 : str2;
+        const shorter = str1.length > str2.length ? str2 : str1;
+        
+        if (longer.length === 0) return 1.0;
+        
+        const editDistance = this.levenshteinDistance(longer, shorter);
+        return (longer.length - editDistance) / longer.length;
+    }
+    
+    /**
+     * 计算编辑距离
+     */
+    private levenshteinDistance(str1: string, str2: string): number {
+        const matrix = [];
+        
+        for (let i = 0; i <= str2.length; i++) {
+            matrix[i] = [i];
+        }
+        
+        for (let j = 0; j <= str1.length; j++) {
+            matrix[0][j] = j;
+        }
+        
+        for (let i = 1; i <= str2.length; i++) {
+            for (let j = 1; j <= str1.length; j++) {
+                if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                } else {
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j - 1] + 1,
+                        matrix[i][j - 1] + 1,
+                        matrix[i - 1][j] + 1
+                    );
+                }
+            }
+        }
+        
+        return matrix[str2.length][str1.length];
+    }
+    
+    /**
+     * 严格验证 - 用于未导入且变量名不匹配的类
+     */
+    private performStrictValidation(
+        classFile: string, 
+        propertyName: string, 
+        varName: string,
+        className: string,
+        documentText: string
+    ): boolean {
+        try {
+            
+            // 1. 如果变量名完全不相关，直接拒绝
+            const similarity = this.calculateStringSimilarity(varName.toLowerCase(), className.toLowerCase());
+            if (similarity < 0.3) {
+                return false;
+            }
+            
+            // 2. 检查文档中是否多次提到这个类
+            const classReferences = (documentText.match(new RegExp(className, 'g')) || []).length;
+            if (classReferences < 2) {
+                return false;
+            }
+            
+            return true;
+        } catch (error) {
+            console.error('严格验证时出错:', error);
+            return false;
+        }
+    }
+    
+    /**
+     * 对未导入的类进行额外验证
+     */
+    private performAdditionalValidation(classFile: string, propertyName: string, documentText: string): boolean {
+        try {
+            const content = fs.readFileSync(classFile, 'utf8');
+            
+            // 检查属性是否是unique的（比如id、name等常见属性要求更严格的验证）
+            const commonProperties = ['id', 'name', 'title', 'status', 'type', 'value'];
+            
+            if (commonProperties.includes(propertyName.toLowerCase())) {
+                // 对于常见属性，要求更强的上下文关联
+                const documentDir = path.dirname(documentText);
+                const classDir = path.dirname(classFile);
+                
+                // 检查文件路径的相关性
+                const relativePath = path.relative(documentDir, classDir);
+                if (relativePath.split(path.sep).length > 3) {
+                    return false;
+                }
+            }
+            
+            return true;
+        } catch (error) {
+            return false;
+        }
+    }
+    
+    /**
+     * 清理缓存
+     */
+    public clearCache(): void {
+        this.classFileCache.clear();
+        this.classPropertyCache.clear();
+    }
+    
+    /**
+     * 从变量名推断类型 - 支持常见的命名模式
+     */
+    private inferTypeFromVariableName(objectName: string, useStatements: Array<{className: string, fullPath: string}>): string | null {
+        if (!objectName.startsWith('$')) {
+            return null;
+        }
+        
+        const varName = objectName.substring(1); // 移除 $ 前缀
+        
+        // 常见的命名模式
+        const patterns = [
+            // 直接匹配：$productDTO -> ProductDTO
+            {
+                pattern: /^(.+)(DTO|Dto)$/,
+                transform: (match: RegExpMatchArray) => {
+                    const baseName = match[1];
+                    return this.capitalizeFirst(baseName) + 'DTO';
+                }
+            },
+            // 实体类：$product -> Product
+            {
+                pattern: /^([a-z][a-zA-Z]+)$/,
+                transform: (match: RegExpMatchArray) => {
+                    return this.capitalizeFirst(match[1]);
+                }
+            },
+            // 带前缀的：$newProduct -> Product
+            {
+                pattern: /^(new|current|old|temp)([A-Z][a-zA-Z]+)$/,
+                transform: (match: RegExpMatchArray) => {
+                    return match[2]; // 直接返回后半部分
+                }
+            },
+            // 复合名称：$productInfo -> ProductInfo
+            {
+                pattern: /^([a-z]+)([A-Z][a-zA-Z]+)$/,
+                transform: (match: RegExpMatchArray) => {
+                    return this.capitalizeFirst(match[1]) + match[2];
+                }
+            },
+            // 带Model后缀：$productModel -> Product
+            {
+                pattern: /^(.+)(Model|Entity|Service)$/i,
+                transform: (match: RegExpMatchArray) => {
+                    const baseName = match[1];
+                    return this.capitalizeFirst(baseName);
+                }
+            }
+        ];
+        
+        // **优先策略：检查特殊的业务逻辑映射**
+        const businessLogicType = this.inferFromBusinessLogic(varName, useStatements);
+        if (businessLogicType) {
+            return businessLogicType;
+        }
+        
+        // 生成所有可能的类名（按优先级排序）
+        const possibleClassNames = this.generatePossibleClassNames(varName);
+        
+        // 按优先级查找匹配的use语句
+        for (const className of possibleClassNames) {
+            
+            const foundInUse = useStatements.find(use => 
+                use.className === className || 
+                use.fullPath.endsWith('\\' + className)
+            );
+            
+            if (foundInUse) {
+                return className;
+            } else {
+            }
+        }
+        
+        // 如果都没找到，使用传统逻辑作为回退
+        for (const {pattern, transform} of patterns) {
+            const match = varName.match(pattern);
+            if (match) {
+                const inferredType = transform(match);
+                return inferredType;
+            }
+        }
+        
+        return null;
+    }
+    
+    /**
+     * 根据业务逻辑推断特殊的类型映射
+     */
+    private inferFromBusinessLogic(varName: string, useStatements: Array<{className: string, fullPath: string}>): string | null {
+        
+        // 特殊的业务逻辑映射规则
+        const businessMappings: Record<string, string[]> = {
+            // 循环变量常见映射：变量名 → 优先考虑的DTO类名
+            'qualification': ['QualificationDTO', 'Qualification'],
+            'product': ['ProductDTO', 'Product'],
+            'access': ['AccessDTO', 'Access'],
+            'invitation': ['InvitationDTO', 'InvitationListDTO', 'Invitation'],
+            'contract': ['ContractDTO', 'Contract'],
+            'supplier': ['SupplierDTO', 'Supplier'],
+            'application': ['ApplicationDTO', 'AccessApplication', 'Application'],
+            'user': ['UserDTO', 'User'],
+            'file': ['FileDTO', 'FileInfo', 'File'],
+            'item': ['ItemDTO', 'Item'],
+            'record': ['RecordDTO', 'Record']
+        };
+        
+        const lowerVarName = varName.toLowerCase();
+        
+        // 检查直接映射
+        if (businessMappings[lowerVarName]) {
+            const candidates = businessMappings[lowerVarName];
+            
+            // 按优先级查找
+            for (const candidate of candidates) {
+                const foundInUse = useStatements.find(use => 
+                    use.className === candidate || 
+                    use.fullPath.endsWith('\\' + candidate)
+                );
+                
+                if (foundInUse) {
+                    return candidate;
+                }
+            }
+            
+        }
+        
+        // 检查复合词的映射 (如 qualificationFile -> QualificationFileDTO)
+        for (const [key, candidates] of Object.entries(businessMappings)) {
+            if (lowerVarName.includes(key)) {
+                
+                // 构建复合词的DTO类名
+                const capitalizedVarName = varName.charAt(0).toUpperCase() + varName.slice(1);
+                const compoundCandidates = [
+                    `${capitalizedVarName}DTO`,
+                    `${capitalizedVarName}`,
+                    ...candidates.map(c => c.replace(key.charAt(0).toUpperCase() + key.slice(1), capitalizedVarName))
+                ];
+                
+                for (const candidate of compoundCandidates) {
+                    const foundInUse = useStatements.find(use => 
+                        use.className === candidate || 
+                        use.fullPath.endsWith('\\' + candidate)
+                    );
+                    
+                    if (foundInUse) {
+                        return candidate;
+                    }
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * 生成可能的类名（按优先级排序，DTO类优先）
+     */
+    private generatePossibleClassNames(varName: string): string[] {
+        const baseName = this.capitalizeFirst(varName);
+        const lowerVarName = varName.toLowerCase();
+        
+        const candidates: string[] = [];
+        
+        // 1. 最高优先级：DTO后缀的变体
+        if (lowerVarName.endsWith('dto')) {
+            // $qualificationDTO -> QualificationDTO
+            candidates.push(baseName);
+        } else {
+            // $qualification -> QualificationDTO (优先尝试DTO后缀)
+            candidates.push(`${baseName}DTO`);
+            candidates.push(`${baseName}Dto`);
+        }
+        
+        // 2. 中等优先级：直接匹配
+        if (!lowerVarName.endsWith('dto')) {
+            candidates.push(baseName);
+        }
+        
+        // 3. 低优先级：其他常见后缀
+        candidates.push(`${baseName}Entity`);
+        candidates.push(`${baseName}Model`);
+        candidates.push(`${baseName}Service`);
+        
+        // 4. 特殊处理：如果是复合词，尝试提取主要部分 + DTO
+        const compoundMatch = varName.match(/^([a-z]+)([A-Z][a-zA-Z]+)$/);
+        if (compoundMatch) {
+            const mainPart = this.capitalizeFirst(compoundMatch[1]);
+            const secondPart = compoundMatch[2];
+            candidates.push(`${mainPart}${secondPart}DTO`);
+        }
+        
+        // 去重并保持顺序
+        return [...new Set(candidates)];
+    }
+    
+    /**
+     * 首字母大写
+     */
+    private capitalizeFirst(str: string): string {
+        if (!str) return str;
+        return str.charAt(0).toUpperCase() + str.slice(1);
+    }
+    
+    /**
+     * 增强的方法调用上下文提取 - 支持链式调用和复杂场景
+     */
+    private extractMethodCallContext(lineText: string, targetMethod: string): {
+        objectName: string;
+        objectType: string | null;
+        confidence: number;
+    } | null {
+        const trimmedLine = lineText.trim();
+        
+        // 场景1: 直接的对象方法调用 $obj->method()
+        const directCallPattern = /(\$\w+)->(\w+)\s*\(/;
+        const directMatch = trimmedLine.match(directCallPattern);
+        if (directMatch && directMatch[2] === targetMethod.replace(/[()]/g, '')) {
+            return {
+                objectName: directMatch[1],
+                objectType: null, // 需要进一步推断
+                confidence: 0.9
+            };
+        }
+        
+        // 场景2: 链式调用 (new Class())->method() 或 $obj->method1()->method2()
+        // 分析链式调用，找出目标方法的真正调用者
+        const methodCalls = this.parseChainedCalls(trimmedLine);
+        for (let i = 0; i < methodCalls.length; i++) {
+            if (methodCalls[i].method === targetMethod.replace(/[()]/g, '')) {
+                if (i === 0) {
+                    // 第一个方法调用，调用者是原始对象
+                    return {
+                        objectName: methodCalls[i].caller,
+                        objectType: methodCalls[i].callerType,
+                        confidence: 0.95
+                    };
+                } else {
+                    // 链式调用中的后续方法，需要追溯调用链
+                    const chainInfo = this.traceCallChain(methodCalls, i);
+                    return {
+                        objectName: chainInfo.objectName,
+                        objectType: chainInfo.objectType,
+                        confidence: chainInfo.confidence
+                    };
+                }
+            }
+        }
+        
+        // 场景3: 复杂表达式中的方法调用
+        const complexPattern = /([^,\s(]+)->(\w+)\s*\(/g;
+        let match;
+        while ((match = complexPattern.exec(trimmedLine)) !== null) {
+            if (match[2] === targetMethod.replace(/[()]/g, '')) {
+                return {
+                    objectName: match[1],
+                    objectType: null,
+                    confidence: 0.7
+                };
+            }
+        }
+        
+        return null;
+    }
+    
+    /**
+     * 解析链式调用，返回每个方法调用的信息
+     */
+    private parseChainedCalls(lineText: string): Array<{
+        caller: string;
+        callerType: string | null;
+        method: string;
+        position: number;
+    }> {
+        const calls: Array<{caller: string; callerType: string | null; method: string; position: number}> = [];
+        
+        // 匹配 (new ClassName()) 模式
+        const newClassPattern = /\(\s*new\s+([A-Za-z_][A-Za-z0-9_\\]*)\s*\(\s*[^)]*\s*\)\s*\)/;
+        const newMatch = lineText.match(newClassPattern);
+        
+        if (newMatch) {
+            // 处理 (new Class())->method() 场景
+            const afterNew = lineText.substring(newMatch.index! + newMatch[0].length);
+            const methodPattern = /->(\w+)\s*\([^)]*\)/g;
+            let methodMatch;
+            let position = newMatch.index! + newMatch[0].length;
+            
+            while ((methodMatch = methodPattern.exec(afterNew)) !== null) {
+                calls.push({
+                    caller: '(new ' + newMatch[1] + '())',
+                    callerType: newMatch[1],
+                    method: methodMatch[1],
+                    position: position + methodMatch.index!
+                });
+                position += methodMatch.index! + methodMatch[0].length;
+            }
+        }
+        
+        // 匹配 $variable->method() 模式
+        const varMethodPattern = /(\$\w+)->(\w+)\s*\([^)]*\)/g;
+        let varMatch;
+        while ((varMatch = varMethodPattern.exec(lineText)) !== null) {
+            calls.push({
+                caller: varMatch[1],
+                callerType: null,
+                method: varMatch[2],
+                position: varMatch.index!
+            });
+        }
+        
+        // 按位置排序
+        calls.sort((a, b) => a.position - b.position);
+        
+        return calls;
+    }
+    
+    /**
+     * 追溯调用链，确定目标方法的实际调用者
+     */
+    private traceCallChain(methodCalls: Array<{
+        caller: string;
+        callerType: string | null;
+        method: string;
+        position: number;
+    }>, targetIndex: number): {
+        objectName: string;
+        objectType: string | null;
+        confidence: number;
+    } {
+        // 对于链式调用，前一个方法的返回值通常是当前方法的调用者
+        // 但在我们的场景中，我们更关心原始的对象类型
+        
+        if (targetIndex > 0) {
+            // 链式调用中的后续方法，通常返回相同类型的对象
+            const firstCall = methodCalls[0];
+            return {
+                objectName: firstCall.caller,
+                objectType: firstCall.callerType,
+                confidence: 0.8  // 稍低的置信度，因为可能有setter返回类型等情况
+            };
+        }
+        
+        // 第一个调用
+        const call = methodCalls[targetIndex];
+        return {
+            objectName: call.caller,
+            objectType: call.callerType,
+            confidence: 0.95
         };
     }
 } 

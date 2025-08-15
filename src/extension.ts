@@ -51,7 +51,11 @@ function debouncedRefreshIndex(filePath?: string): void {
                         await safeExecuteCommand('workbench.action.closeActiveEditor');
                     }
                 } catch (error) {
-                    console.error(`处理文件 ${file} 时出错:`, error);
+                    if (error instanceof Error && error.name === 'Canceled') {
+                        console.log(`文件 ${file} 处理被取消，跳过`);
+                    } else {
+                        console.error(`处理文件 ${file} 时出错:`, error);
+                    }
                 }
             }
         } else {
@@ -62,7 +66,11 @@ function debouncedRefreshIndex(filePath?: string): void {
                     const doc = await vscode.workspace.openTextDocument(uri);
                     await vscode.languages.setTextDocumentLanguage(doc, 'php');
                 } catch (error) {
-                    console.error(`处理文件 ${file} 时出错:`, error);
+                    if (error instanceof Error && error.name === 'Canceled') {
+                        console.log(`文件 ${file} 处理被取消，跳过`);
+                    } else {
+                        console.error(`处理文件 ${file} 时出错:`, error);
+                    }
                 }
             }
         }
@@ -91,37 +99,72 @@ async function refreshAccessorDirectoryIndex() {
         
         // 遍历所有工作区文件夹
         for (const folder of workspaceFolders) {
-            // 查找所有PHP文件
-            const phpFiles = await vscode.workspace.findFiles(
-                new vscode.RelativePattern(folder, '**/*.php'),
-                '**/vendor/**'
-            );
+            try {
+                // 创建超时控制的 CancellationToken
+                const source = new vscode.CancellationTokenSource();
+                const timeout = setTimeout(() => {
+                    source.cancel();
+                }, 10000); // 10秒超时
 
-            // 遍历所有PHP文件所在的目录，检查是否有.php-accessor目录
-            for (const phpFile of phpFiles) {
-                const phpDir = path.dirname(phpFile.fsPath);
-                const accessorDir = path.join(phpDir, '.php-accessor');
-                
-                // 如果.php-accessor目录存在
-                if (fs.existsSync(accessorDir)) {
-                    // 获取.php-accessor目录中的所有PHP文件
-                    const accessorFiles = fs.readdirSync(accessorDir)
-                        .filter(file => file.endsWith('.php'))
-                        .map(file => path.join(accessorDir, file));
+                try {
+                    // 查找所有PHP文件，使用超时控制
+                    const phpFiles = await vscode.workspace.findFiles(
+                        new vscode.RelativePattern(folder, '**/*.php'),
+                        '**/vendor/**',
+                        1000, // 限制最多1000个文件
+                        source.token
+                    );
 
-                    // 只处理一部分文件即可触发索引刷新
-                    accessorFilesCount += accessorFiles.length;
-                    const MAX_FILES_PER_DIR = 3;  // 每个目录最多处理3个文件
+                    clearTimeout(timeout);
                     
-                    const filesToProcess = accessorFiles.length > MAX_FILES_PER_DIR 
-                        ? accessorFiles.slice(0, MAX_FILES_PER_DIR) 
-                        : accessorFiles;
-                    
-                    // 添加到待处理文件列表
-                    for (const accessorFile of filesToProcess) {
-                        pendingFilesToRefresh.add(accessorFile);
+                    // 检查操作是否被取消
+                    if (source.token.isCancellationRequested) {
+                        console.log('文件搜索被取消，跳过该工作区文件夹');
+                        continue;
                     }
+
+                    // 遍历所有PHP文件所在的目录，检查是否有.php-accessor目录
+                    for (const phpFile of phpFiles) {
+                        const phpDir = path.dirname(phpFile.fsPath);
+                        const accessorDir = path.join(phpDir, '.php-accessor');
+                        
+                        // 如果.php-accessor目录存在
+                        if (fs.existsSync(accessorDir)) {
+                            try {
+                                // 获取.php-accessor目录中的所有PHP文件
+                                const accessorFiles = fs.readdirSync(accessorDir)
+                                    .filter(file => file.endsWith('.php'))
+                                    .map(file => path.join(accessorDir, file));
+
+                                // 只处理一部分文件即可触发索引刷新
+                                accessorFilesCount += accessorFiles.length;
+                                const MAX_FILES_PER_DIR = 3;  // 每个目录最多处理3个文件
+                                
+                                const filesToProcess = accessorFiles.length > MAX_FILES_PER_DIR 
+                                    ? accessorFiles.slice(0, MAX_FILES_PER_DIR) 
+                                    : accessorFiles;
+                                
+                                // 添加到待处理文件列表
+                                for (const accessorFile of filesToProcess) {
+                                    pendingFilesToRefresh.add(accessorFile);
+                                }
+                            } catch (dirError) {
+                                console.log(`读取目录 ${accessorDir} 时出错:`, dirError);
+                            }
+                        }
+                    }
+                } catch (searchError) {
+                    clearTimeout(timeout);
+                    if (searchError instanceof Error && searchError.name === 'Canceled') {
+                        console.log('文件搜索操作被取消，跳过该工作区文件夹');
+                    } else {
+                        console.log('搜索文件时出错:', searchError);
+                    }
+                } finally {
+                    source.dispose();
                 }
+            } catch (folderError) {
+                console.log(`处理工作区文件夹 ${folder.uri.fsPath} 时出错:`, folderError);
             }
         }
         
@@ -132,8 +175,12 @@ async function refreshAccessorDirectoryIndex() {
             debouncedRefreshIndex();
         }
     } catch (error) {
-        console.error('刷新 PHP Accessor 文件索引时出错:', error);
-        vscode.window.showErrorMessage('刷新 PHP Accessor 文件索引失败');
+        if (error instanceof Error && error.name === 'Canceled') {
+            console.log('刷新 PHP Accessor 文件索引操作被取消');
+        } else {
+            console.error('刷新 PHP Accessor 文件索引时出错:', error);
+            vscode.window.showErrorMessage('刷新 PHP Accessor 文件索引失败');
+        }
     }
 }
 
@@ -246,6 +293,106 @@ export function activate(context: vscode.ExtensionContext) {
         accessorNavigator.navigateToAccessor();
     }));
     
+    // 注册调试命令
+    disposables.push(vscode.commands.registerCommand('php-accessor-vscode.debug', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('请在PHP文件中使用调试功能');
+            return;
+        }
+
+        const document = editor.document;
+        const position = editor.selection.active;
+        const word = document.getText(document.getWordRangeAtPosition(position));
+        
+        console.log('=== 🔧 PHP Accessor 手动调试 ===');
+        console.log(`📁 当前文件: ${document.fileName}`);
+        console.log(`📍 光标位置: 行${position.line + 1}, 列${position.character + 1}`);
+        console.log(`🎯 选中词语: "${word}"`);
+        
+        // 检查是否是代理文件
+        const isProxyFile = accessorNavigator.isHyperfProxyFile(document.fileName);
+        console.log(`🔍 是否代理文件: ${isProxyFile ? '是' : '否'}`);
+        
+        if (isProxyFile) {
+            vscode.window.showInformationMessage('🔍 代理类调试已启动，请查看控制台详细信息');
+            console.log('💡 请在代理trait的方法上点击F12测试跳转，控制台将显示详细的调试信息');
+        } else {
+            vscode.window.showInformationMessage('📋 当前文档调试信息已输出到控制台');
+        }
+        
+        // 显示项目结构信息
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (workspaceFolders && workspaceFolders.length > 0) {
+            console.log(`📂 工作区根目录: ${workspaceFolders[0].uri.fsPath}`);
+            
+            // 检查.php-accessor目录
+            const phpAccessorPath = path.join(workspaceFolders[0].uri.fsPath, '.php-accessor');
+            const hasPhpAccessor = fs.existsSync(phpAccessorPath);
+            console.log(`📦 .php-accessor目录: ${hasPhpAccessor ? '存在' : '不存在'} (${phpAccessorPath})`);
+            
+            if (hasPhpAccessor) {
+                const metaPath = path.join(phpAccessorPath, 'meta');
+                const hasMetaDir = fs.existsSync(metaPath);
+                console.log(`📋 meta目录: ${hasMetaDir ? '存在' : '不存在'} (${metaPath})`);
+                
+                const proxyPath = path.join(phpAccessorPath, 'proxy');
+                const hasProxyDir = fs.existsSync(proxyPath);
+                console.log(`🎭 proxy目录: ${hasProxyDir ? '存在' : '不存在'} (${proxyPath})`);
+            }
+        }
+        
+        console.log('=== 🔧 手动调试信息输出完成 ===');
+        
+        // 如果不是代理文件且选中了方法名，尝试测试跳转逻辑
+        if (!isProxyFile && word && (word.startsWith('get') || word.startsWith('set'))) {
+            console.log('🚀 检测到accessor方法，尝试测试跳转逻辑...');
+            try {
+                const result = await accessorNavigator.getDefinitionProvider().provideDefinition(
+                    document,
+                    position,
+                    { isCancellationRequested: false, onCancellationRequested: () => ({ dispose: () => {} }) }
+                );
+                if (result) {
+                    console.log('✅ 跳转测试成功完成');
+                } else {
+                    console.log('❌ 跳转测试未找到结果');
+                }
+            } catch (error) {
+                console.log('❌ 跳转测试出错:', error);
+            }
+        }
+    }));
+    
+    // 注册代理类诊断命令
+    disposables.push(vscode.commands.registerCommand('php-accessor-vscode.diagnose-proxy', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('请在代理trait文件中使用此功能');
+            return;
+        }
+
+        const document = editor.document;
+        const isProxyFile = accessorNavigator.isHyperfProxyFile(document.fileName);
+        
+        if (!isProxyFile) {
+            vscode.window.showWarningMessage('当前文件不是Hyperf代理trait文件');
+            return;
+        }
+        
+        vscode.window.showInformationMessage('🔍 代理类诊断已启动，请查看控制台');
+        
+        console.log('=== 🏥 代理类诊断开始 ===');
+        
+        // 手动触发一次代理文件导航来获取详细诊断信息
+        const fileName = path.basename(document.fileName, '.php');
+        console.log(`🎭 诊断代理文件: ${fileName}`);
+        
+        // 模拟点击getAccessNo方法进行诊断
+        console.log('💡 建议：在任意getter/setter方法上点击F12查看完整跳转过程');
+        console.log('=== 🏥 代理类诊断完成 ===');
+    }));
+    
     // 注册提供器
     disposables.push(vscode.languages.registerDefinitionProvider(
         { language: 'php' },
@@ -350,33 +497,68 @@ async function configurePHPLanguageServer() {
                 const workspaceFolders = vscode.workspace.workspaceFolders;
                 if (workspaceFolders) {
                     for (const folder of workspaceFolders) {
-                        const phpFiles = await vscode.workspace.findFiles(
-                            new vscode.RelativePattern(folder, '**/*.php'),
-                            '**/vendor/**'
-                        );
-                        
-                        for (const phpFile of phpFiles) {
-                            const phpDir = path.dirname(phpFile.fsPath);
-                            const accessorDir = path.join(phpDir, '.php-accessor');
-                            
-                            // 如果.php-accessor目录存在
-                            if (fs.existsSync(accessorDir)) {
-                                // 尝试设置Intelephense的存根目录
-                                try {
-                                    const intelephenseStubs = config.get('intelephense.stubs', []) as string[];
-                                    if (!intelephenseStubs.includes(accessorDir)) {
-                                        intelephenseStubs.push(accessorDir);
-                                        await config.update('intelephense.stubs', intelephenseStubs, vscode.ConfigurationTarget.Workspace);
-                                    }
-                                } catch (error) {
-                                    console.log('设置intelephense.stubs时出错:', error);
+                        try {
+                            // 创建超时控制的 CancellationToken
+                            const source = new vscode.CancellationTokenSource();
+                            const timeout = setTimeout(() => {
+                                source.cancel();
+                            }, 8000); // 8秒超时（激活时间稍短）
+
+                            try {
+                                const phpFiles = await vscode.workspace.findFiles(
+                                    new vscode.RelativePattern(folder, '**/*.php'),
+                                    '**/vendor/**',
+                                    500, // 激活时限制更少的文件数量
+                                    source.token
+                                );
+
+                                clearTimeout(timeout);
+                                
+                                // 检查操作是否被取消
+                                if (source.token.isCancellationRequested) {
+                                    console.log('激活时文件搜索被取消，跳过该工作区');
+                                    continue;
                                 }
+                                
+                                for (const phpFile of phpFiles) {
+                                    const phpDir = path.dirname(phpFile.fsPath);
+                                    const accessorDir = path.join(phpDir, '.php-accessor');
+                                    
+                                    // 如果.php-accessor目录存在
+                                    if (fs.existsSync(accessorDir)) {
+                                        // 尝试设置Intelephense的存根目录
+                                        try {
+                                            const intelephenseStubs = config.get('intelephense.stubs', []) as string[];
+                                            if (!intelephenseStubs.includes(accessorDir)) {
+                                                intelephenseStubs.push(accessorDir);
+                                                await config.update('intelephense.stubs', intelephenseStubs, vscode.ConfigurationTarget.Workspace);
+                                            }
+                                        } catch (error) {
+                                            console.log('设置intelephense.stubs时出错:', error);
+                                        }
+                                    }
+                                }
+                            } catch (searchError) {
+                                clearTimeout(timeout);
+                                if (searchError instanceof Error && searchError.name === 'Canceled') {
+                                    console.log('激活时文件搜索操作被取消');
+                                } else {
+                                    console.log('搜索文件时出错:', searchError);
+                                }
+                            } finally {
+                                source.dispose();
                             }
+                        } catch (folderError) {
+                            console.log(`处理工作区文件夹 ${folder.uri.fsPath} 时出错:`, folderError);
                         }
                     }
                 }
             } catch (error) {
-                console.log('查找.php-accessor目录时出错:', error);
+                if (error instanceof Error && error.name === 'Canceled') {
+                    console.log('查找.php-accessor目录操作被取消');
+                } else {
+                    console.log('查找.php-accessor目录时出错:', error);
+                }
             }
         } else {
             console.log('Intelephense 扩展未安装，跳过相关配置');
